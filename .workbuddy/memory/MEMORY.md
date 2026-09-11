@@ -17,7 +17,26 @@
 - 现状：v3 清单 7 个（LunaTVSource 归 OneBigMoon，其余 6 个 narrator-z）；v2 清单 6 个（无 LunaTVSource，v2 无代码）。
 - **发版校验脚本**（必做）：比对 清单 version/author ↔ 代码 `plugin_version`/`plugin_author` ↔ 目录集合 ↔ JACKETT_DOMAIN 占位符。正则必须用 `^\s*字段名\s*=`（类变量有缩进，否则全匹配为 None 误报不同步）。
 
-## 三、插件市场机制（v3.0.37 实测，2026-09-12）
+## 三、LunaTVSource 上游同步（fork 维护，2026-09-12 建立）
+
+本仓库是**手工建的**（非 GitHub fork，无共同历史），不能用 `git merge` 同步上游 jxxghp/MoviePilot-Plugins。
+
+- **基线定位**：NAS 上 `git clone --unshallow` 上游 → 遍历 `git log --format=%H -- plugins.v3/lunatvsource/__init__.py`
+  各提交 → difflib 与本地比对取差异最小者。当前基线 **上游 0.4.59（03b0fd2）**。
+- **⚠️ 比较必须用 difflib 的 `splitlines()` 结果，不能用 `diff` 命令**：`core.autocrlf=true` 让工作区 CRLF、
+  git 内 LF，`diff` 会把整个文件判为不同（`1,5672c1,5672`），完全看不出真实差异。
+- **本分支定制仅 2 处（都在 `cms.py`）**，其余 py 文件与上游基线逐行一致：
+  1. `_BRACKET_TAG_RE` + `_normalize_cms_title()`：苹果 CMS 片名 【...】/[...] → `(...)`，
+     规避 MoviePilot 核心 `is_anime()` 把「剧名【年份】【地区/类型】【字幕】」误判为动漫。
+  2. `_result_from_item()` 里 `title = _normalize_cms_title(_text(...))`。
+- **同步策略**：版本差距大时（曾跨 23 个版本，`__init__.py` 7355 vs 5672 行）不要 cherry-pick，
+  直接**上游全量替换 + 重新应用这 2 处定制**，并把上游 changelog 并入清单 history。
+- 上游是**多文件 + 前端 dist** 插件（ai/cms/downloader/m3u8_engine/naming/classification + dist + vendor/N_m3u8DL-RE），
+  替换要整目录覆盖，别只换 `__init__.py`。
+- 部署后**用 `__pycache__` 里有无 pyc 判断插件是否真被加载**（比翻日志可靠）：已加载的插件
+  目录下会有 `.pyc`，未启用的为 0 个。
+
+## 四、插件市场机制（v3.0.37 实测，2026-09-12）
 
 - `settings.VERSION_FLAG='v3'`，`get_compatible_version_flags()=['v3','v2']`；`PLUGIN_MARKET` 默认 74 个仓库，本仓库排在最后一位。
 - 索引选择：有 flag 读 `package.{flag}.json`，无 flag 读 `package.json`。基础索引现已补齐（此前为空 `{}`，会让无 flag 实例解析出 0 个插件）。
@@ -57,7 +76,7 @@
 - NeoDB 条目 `external_resources[]` 含 tmdb/douban/imdb 映射，正则提取写入 `MediaInfo.tmdb_id/douban_id/imdb_id`，否则订阅不可用。
 - 详情页增强：演员表走**免 token** `GET /api/catalog/{category}/{uuid}/credit/`；相似推荐走 `GET /api/catalog/item/{uuid}/similar`（**需 OAuth2 Bearer**，无 token 401），因 `MediaInfo` 无该字段，以文本块注入 `mi.overview` 显示。配置项 `neodb_token` 留空则只显示演员表。
 
-## 七、NeoDB 公开 API 能力边界（2026-07-31 实测）
+## 八、NeoDB 公开 API 能力边界（2026-07-31 实测）
 
 - 只有 `GET /api/trending/{category}/`（book/game/movie/music/performance/podcast/tv），**每类仅 60 条，第 2 页起完全重复** → 「看不到全部」的真正根因，非 bug 非鉴权。
 - **不存在** `/api/ranking/`、`/api/discover/`（404）。
@@ -71,4 +90,4 @@
 
 - **ChineseSubFinder v6.0.2**：① 修 post_message 签名坑；② ERROR「调用 API 失败 HTTP 500: open ...nfo」根因是**时序竞态**（CSF 靠 Emby/Jellyfin 生成的 .nfo 取 id，TransferComplete 触发时 .nfo 未生成，约 1 分钟后才有）→ 改为后台线程 + 5xx/网络异常最多 5 次间隔 20s 重试，4xx 或耗尽才上报。
 - **StuckDownloadGuard v1.1.0**：新增「降级切换」——先降级排队尾，再换源（订阅走 `SubscribeChain().search(sid)`，非订阅走 `SearchChain().search_by_title(title)` 跨索引器取做种最多者 + `DownloadChain().download_single(context=..., torrent_content=..., label=settings.TORRENT_TAG)`），每卡顿周期仅切换一次，无效则停止清理。配置项 `switch_source` 默认 True。
-- 已发布：`NeoDBSource` v1.0.4、`ChineseSubFinder` v6.0.2、`StuckDownloadGuard` v1.1.0、`JackettExtend` v6.0.2、`ProwlarrExtend` v6.0.0、`JackettIndexer` v6.0.1、`LunaTVSource` v0.4.83、`SiteOpenSignup`。
+- 已发布：`NeoDBSource` v1.0.4、`ChineseSubFinder` v6.0.2、`StuckDownloadGuard` v1.1.0、`JackettExtend` v6.0.2、`ProwlarrExtend` v6.0.0、`JackettIndexer` **v6.1.0**、`LunaTVSource` **v0.4.84**、`SiteOpenSignup`。
