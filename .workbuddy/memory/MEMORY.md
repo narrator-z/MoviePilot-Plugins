@@ -22,7 +22,9 @@
 - `settings.VERSION_FLAG='v3'`，`get_compatible_version_flags()=['v3','v2']`；`PLUGIN_MARKET` 默认 74 个仓库，本仓库排在最后一位。
 - 索引选择：有 flag 读 `package.{flag}.json`，无 flag 读 `package.json`。基础索引现已补齐（此前为空 `{}`，会让无 flag 实例解析出 0 个插件）。
 - **跨仓库去重（`catalog.py:370-386`）**：按插件 ID 去重，**版本号高者胜出**。LunaTVSource 已由 0.4.60 抬至 0.4.83 压过 jxxghp 的 0.4.82。
-- **市场页（`state=market`）排除已安装且无更新的插件**（`catalog.py:509-520`）——「按作者搜索只剩 1 个」的真正原因，不是分页也不是 bug。看已装的去「已安装」页（`state=installed`）。
+- **市场页（`state=market`）排除已安装且无更新的插件**（`catalog.py:509-520`）——「按作者搜索只剩几个」的真正原因，不是分页也不是 bug。看已装的去「已安装」页（`state=installed`）。
+- **可见数量 = 本仓库条目 − 已装且无更新的条目**。2026-09-12 实测：用户已装 ChineseSubFinder/JackettExtend/StuckDownloadGuard/NeoDBSource（版本与市场一致）→ 6 个 narrator-z 插件里只显示未装的 ProwlarrExtend、JackettIndexer 共 2 个。判断"看不全"前先算这个，别急着改仓库。
+- 判定「已安装」看 `systemconfig.UserInstalledPlugins`（不只是 `/config/plugins/` 目录，fork 镜像内置 `/app/app/plugins/<id>/` 也算）。
 - ⚠️ **旧结论「API 默认只返回 50 条」已作废**：`plugin.py:207` 现为 `max_results=None`（不传即全量）；仅传了 `page`/`count` 才分页（默认 50）。前端市场页实测不带分页参数。
 
 ## 四、NAS / 部署环境
