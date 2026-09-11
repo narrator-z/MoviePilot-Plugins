@@ -89,13 +89,14 @@
     "name": "Jackett索引器",
     "description": "集成Jackett索引器搜索，支持Torznab协议多站点搜索。仅索引私有和半公开站点。",
     "labels": "索引器,Jackett",
-    "version": "6.0.1",
+    "version": "6.1.0",
     "icon": "Jackett_A.png",
     "author": "narrator-z",
     "level": 1,
     "history": {
       "v6.0.0": "补充 V2 市场索引条目：此前代码已存在于 plugins.v2/jackettindexer/，但未在 package.v2.json 登记，导致 V2 实例在市场中检索不到该插件。",
-      "v6.0.1": "修正市场索引署名：作者由 Claude 改为仓库维护者 narrator-z，与其余插件保持一致，便于按作者检索；同步调整插件内域名占位符模板以匹配新署名，索引器域名生成逻辑与已注册站点不受影响。"
+      "v6.0.1": "修正市场索引署名：作者由 Claude 改为仓库维护者 narrator-z，与其余插件保持一致，便于按作者检索；同步调整插件内域名占位符模板以匹配新署名，索引器域名生成逻辑与已注册站点不受影响。",
+      "v6.1.0": "版本抬升至 6.1.0，与已安装的 JackettExtend（6.0.2）在版本号上拉开距离，避免两个不同插件被混淆：JackettExtend 用于扩展 MoviePilot 检索以支持 Jackett 站点，本插件用于把 Jackett索引器接入 Torznab 搜索。功能无变化。"
     }
   }
 }
