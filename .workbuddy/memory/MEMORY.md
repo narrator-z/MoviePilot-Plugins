@@ -1,91 +1,69 @@
-# MoviePilot-PluginsV2 项目长期记忆
+# MoviePilot-Plugins 项目长期记忆
 
-## 插件开发硬性规则（踩坑固化）
+## 一、插件开发硬性规则（踩坑固化）
 
-1. **版本号双字段必须同步**：`__init__.py` 的 `plugin_version`（MP 实际加载/显示/日志用）与 `package.v2.json` 的 `version`（Market 更新比较用）每次发版都要一起改，保持一致。只改其一 → Market 更新后显示版本不变、且反复提示有更新。
-2. **本地 `py_compile` 查不出运行期未定义名称**：插件加载失败（如漏 import 枚举、`NameError`）只在 MP 容器实际加载时暴露。改完代码应在容器内验证：
-   `docker exec moviepilot python3 -c "from app.schemas.types import EventType, ChainEventType, ..."`
-3. **排查"插件不显示/安装失败/不生效"的事实来源**：直接 SSH 上 NAS 查 `/config/logs/moviepilot.log` 的 `加载插件 X 失败` 行，不要猜网络/镜像/SSH。Market 安装失败时 MP 会把插件备份到 `/config/plugins_backup` 但不装回 `/config/plugins`，故表现为不显示。
-4. **容器镜像可能与本地源码版本不一致**：用户容器是 `ghcr.io/narrator-z/moviepilot:latest`（用户自己 fork 构建），导入路径、事件枚举以容器内为准，不要只信本地 `E:\github\MoviePilot`。
+1. **版本号双字段必须同步**：`__init__.py` 的 `plugin_version`（MP 加载/显示用）与清单 `package*.json` 的 `version`（Market 更新比较用）必须一起改。只改其一 → Market 显示版本不变且反复提示更新。已栽过两次（JackettExtend、本次 v2 清单）。
+2. **清单条目必须有同名代码目录**：`package.v2.json` 对应 `plugins.v2/<id>/`，`package.v3.json` 对应 `plugins.v3/<id>/`（目录全小写，`pid.lower()` 匹配）。**v3-only 插件只进 v3 清单和基础索引，不进 v2 清单**（登记了会指向空目录导致安装失败）。
+3. **改元数据前先 grep `plugin_author` 是否被业务逻辑引用**：JackettIndexer 用它当域名占位符（见坑位 7）。
+4. **本地 `py_compile` 查不出运行期未定义名称**（漏 import 枚举 / NameError），只在容器实际加载时暴露。改完应在容器内验证：`docker exec moviepilot python3 -c "from app.schemas.types import ..."`。
+5. **排查"插件不显示/安装失败/不生效"**：SSH 上 NAS 查 `/config/logs/moviepilot.log` 的 `加载插件 X 失败`，不要猜网络/镜像。Market 安装失败时 MP 把插件备份到 `/config/plugins_backup` 但不装回 `/config/plugins` → 表现为不显示。
+6. **容器镜像可能与本地源码不一致**（用户自建 fork 镜像），导入路径、事件枚举以容器内为准，别只信本地 `E:\github\MoviePilot`。
 
-## NAS / 部署环境（实测可用）
+## 二、仓库清单维护（2026-09-12 修订）
+
+- 三份索引：`package.json`（基础，无 VERSION_FLAG 实例读）、`package.v2.json`、`package.v3.json`。
+- **基础索引必须显式带 `"v3": true`** —— `is_plugin_info_compatible` 在 flag=v3 时要求条目声明，否则读到也被过滤；配合 `system_version: ">=3.0.0"` 阻止低版本误装。
+- v2 清单格式差异：icon 用相对文件名（`"Jackett_A.png"`），**无** `release` / `system_version` 字段。
+- 现状：v3 清单 7 个（LunaTVSource 归 OneBigMoon，其余 6 个 narrator-z）；v2 清单 6 个（无 LunaTVSource，v2 无代码）。
+- **发版校验脚本**（必做）：比对 清单 version/author ↔ 代码 `plugin_version`/`plugin_author` ↔ 目录集合 ↔ JACKETT_DOMAIN 占位符。正则必须用 `^\s*字段名\s*=`（类变量有缩进，否则全匹配为 None 误报不同步）。
+
+## 三、插件市场机制（v3.0.37 实测，2026-09-12）
+
+- `settings.VERSION_FLAG='v3'`，`get_compatible_version_flags()=['v3','v2']`；`PLUGIN_MARKET` 默认 74 个仓库，本仓库排在最后一位。
+- 索引选择：有 flag 读 `package.{flag}.json`，无 flag 读 `package.json`。基础索引现已补齐（此前为空 `{}`，会让无 flag 实例解析出 0 个插件）。
+- **跨仓库去重（`catalog.py:370-386`）**：按插件 ID 去重，**版本号高者胜出**。LunaTVSource 已由 0.4.60 抬至 0.4.83 压过 jxxghp 的 0.4.82。
+- **市场页（`state=market`）排除已安装且无更新的插件**（`catalog.py:509-520`）——「按作者搜索只剩 1 个」的真正原因，不是分页也不是 bug。看已装的去「已安装」页（`state=installed`）。
+- ⚠️ **旧结论「API 默认只返回 50 条」已作废**：`plugin.py:207` 现为 `max_results=None`（不传即全量）；仅传了 `page`/`count` 才分页（默认 50）。前端市场页实测不带分页参数。
+
+## 四、NAS / 部署环境
+
 - SSH：`192.168.31.145:22022`，用户 `narratorz`，密钥 `~/.ssh/id_ed25519_1panel`。
-- MoviePilot 容器：**`moviepilot`**（2026-09 重装后已改名，不再是 `moviepilot`）；插件目录（挂载卷）`/config/plugins/<id>/`；备份 `/config/plugins_backup/`；日志 `/config/logs/moviepilot.log`。代码 `/app/app`，**前端静态 `/public/assets/`**。
-- 部署修复文件：本地 scp → `docker cp` 进容器 → `docker restart moviepilot`；冷启动约 30–60s 后查日志。
-- 调试技巧：`docker exec moviepilot python3` 可直接 import 插件验证；`PluginManager()` 直接 import 拿到的是未初始化实例，无法验证运行时源生成。
-- 容器内验证市场/接口行为：`docker exec -i moviepilot python3 - < script.py`（stdin 送脚本）。注意应用工厂是 `/app/app/factory.py`，**`app.main` 的 app 只有 6 条路由，不能用于 TestClient**；版本号取 `app.runtime.version.get_app_version()`（不是 `app.utils.version`）。
+- 容器：**`moviepilot`**；插件目录 `/config/plugins/<id>/`，备份 `/config/plugins_backup/`，日志 `/config/logs/moviepilot.log`。代码 `/app/app`，**前端静态 `/public/assets/`**。
+- 部署：本地 scp → `docker cp` 进容器 → `docker restart moviepilot`；冷启动 30–60s 后查日志。
+- 调试：`docker exec moviepilot python3` 可直接 import 验证；`PluginManager()` 直接 import 是未初始化实例，无法验证运行时源生成。
+- 容器内跑脚本：`docker exec -i moviepilot python3 - < script.py`。**应用工厂是 `/app/app/factory.py`**（`app.main` 的 app 只有 6 条路由，不能用于 TestClient）；版本取 `app.runtime.version.get_app_version()`。
+- ⚠️ 2026-09-12：**本机无法出网**（代理 `127.0.0.1:65120` 端口在监听但上游 TLS 握手超时，绕过沙箱也一样）→ git push 需网络恢复后手动执行。
 
-## 插件市场机制（v3.0.37 实测，2026-09-12）
-- `settings.VERSION_FLAG='v3'`，`get_compatible_version_flags()=['v3','v2']`；`PLUGIN_MARKET` 默认 74 个仓库，**本仓库排在最后一位**。
-- 索引文件选择：`package.{flag}.json`（有 flag）/ `package.json`（无 flag）。**本仓库 `package.json` 是空 `{}`** → 无 VERSION_FLAG 的实例解析出 0 个插件。
-- 跨仓库去重（`catalog.py:370-386`）：按插件 ID 去重，**版本号高者胜出** → LunaTVSource 本仓库 0.4.60 被 jxxghp 的 0.4.82 顶掉。
-- **市场页（`state=market`）会排除已安装且无更新的插件**（`catalog.py:509-520`）。这是「按作者搜索只剩 1 个」的真正原因，不是分页也不是 bug。
-- ⚠️ **旧结论「API 默认只返回 50 条」已作废**：`plugin.py:207` 现为 `max_results=None`（不传即全量）；仅在传了 `page`/`count` 时才分页（默认 50）。前端市场页实测 `get("plugin/",{params:{state:"market",force:e}})` 不带分页 → 全量。
+## 五、关键坑位
 
-## 已发布插件
-- `NeoDBSource`（探索/推荐/识别 NeoDB 数据源，v1.0.4）、`ChineseSubFinder`（v6.0.2）、`StuckDownloadGuard`（v1.1.0）、`JackettExtend`、`ProwlarrExtend`、`SiteOpenSignup`。
-- 目录名小写 = 类名/key 小写 = 插件 ID；Market 文件列表安装按 `pid.lower()` 匹配目录。
+1. **fork 镜像内置插件 shadow Market 副本**：`/app/app/plugins/neodbsource/` 与 Market 装的 `/config/plugins/neodbsource/` 同名，实际加载的是 `/app/app` 内置那份。修代码必须 docker cp 到内置路径（chinesesubfinder、stuckdownloadguard 只有内置路径，无 `/config/plugins` 副本），清 `__pycache__` 后重启。
+2. **`MediaInfo.year` 是 str 不是 int**：详情端点有 response_model 校验，`int(...)` 触发 `ResponseValidationError` → HTTP 500。一律 `str(year)`。
+3. **`MediaType` 枚举值是中文**：`MediaType.MOVIE.value == "电影"`，要传中文，传 `MOVIE` 会 ValueError（假 500）。
+4. **图片代理已正确配置**：`IMAGE_PROXY_ALLOWED_PRIVATE_RANGES=["198.123.0.0/16","fdfe:dcba:9876::/64"]` 覆盖 clash fake-ip。测试硬传 `None` 会误报 non_global_dns_result。容器 `settings.PROXY=None`，fake-ip IPv6 失败后回退 IPv4 可达，无需处理。
+5. **列表缩略图优先取 `poster_path`**：只设 `cover` 会显示空白。
+6. **post_message 签名已变（影响所有插件）**：fork 为 `post_message(channel=None, mtype=None, title=None, text=None, image=None, link=None, userid=None, username=None, **kwargs)`。**禁止** `self.post_message(Notification(...))`（整个对象被当 channel 传入 → channel 校验崩溃 → 所有通知失效）。正确：`self.post_message(mtype=NotificationType.Plugin, title=..., text=..., source=self.plugin_name)`。
+7. **JackettIndexer 的 `plugin_author` 是业务变量**：`JACKETT_DOMAIN = "jackett_indexer.<author小写>"`，运行时 `replace(plugin_author.lower(), indexer_name)` 生成域名。**占位符必须与 `plugin_author.lower()` 完全一致**，否则 replace 不命中 → 所有索引器共用同一 domain → 功能失效。v2/v3 两份代码已同步为 `narrator-z` 并加警示注释。
 
-## NeoDBSource 详情页增强（v1.0.4，2026-08-01）
-- **演员表**：点击探索页 NeoDB 条目 → 详情页 `media_info` 端点 → `async_recognize_media` → `_recognize_by_neodb_id` 内调用**免 token**的 `GET /api/catalog/{category}/{uuid}/credit/`，映射为 `MediaInfo.actors`（List[dict]，字段 name/character/profile_path）。详情页原生渲染演员表。实测 20 条正常。
-- **相似推荐**：`GET /api/catalog/item/{uuid}/similar` **必须 OAuth2 Bearer token**（无 token → 401）。因 `schemas.MediaInfo` 无 recommend/similar 字段，相似条目以文本块 `🎬 NeoDB 相似推荐：` 注入 `mi.overview` 才能在详情页显示。
-- 新增配置项 `neodb_token`（密码框）：用户填入自己的 NeoDB OAuth access_token 后解锁相似推荐；留空则只显示演员表。
-- 演员 `character` 仅取 `character_name`（为空即空），不回退 role，避免详情页显示 "角色: actor" 这种脏数据。
-- 部署：scp → docker cp 到 `/app/app/plugins/neodbsource/`(内置,实际加载) 与 `/config/plugins/neodbsource/`(Market) 双路径 → 清 `__pycache__` → `docker restart moviepilot`。
+## 六、探索页自定义数据源（NeoDBSource）关键机制
 
-## 插件：让探索页自定义数据源的条目可点击跳转（关键机制）
-- 探索页点击条目 → 媒体详情页 `app/api/endpoints/media.py:media_info` → `parse_media_key("neodb:tv.uuid")` → `async_recognize_media(source="neodb", mediaid="tv.uuid")`。
-- **要点**：要使自定义源（如 `neodb:`）的点击识别生效，**必须把 recognize 方法通过 `get_module()` 注册为插件模块**（插件 `_enabled` 时即返回 `recognize_media`/`async_recognize_media`），而**不能**依赖某个「媒体识别」子开关或 ChainBase 补丁——否则子开关未开时核心识别不了该源 → 返回空 → 前端报「未识别到媒体信息」。
-- 注册为模块的方法要**只处理本源**（`source=="neodb" and mediaid` 时回查构造 MediaInfo），其余来源返回 None 交还核心，否则会抢在 TMDB/豆瓣之前「赢者通吃」覆盖正常识别（async_run_module 插件模块先于系统模块执行）。
-- 同理：MP 图片代理对**公网域名自动放行**（DNS 检查），`SECURITY_IMAGE_DOMAINS` 主要给内网/私有图床用；自定义源封面若是公网域名无需手动加白名单（插件也可在 `init_plugin` 运行时 append 进白名单）。
-- NeoDB 条目 `external_resources[]` 的 URL 含 tmdb/douban/imdb 映射，需用正则提取并写入 `MediaInfo.tmdb_id/douban_id/imdb_id`，详情页与订阅才能用；无外链的条目只能浏览详情、订阅需有 tmdb/douban。
+- 点击条目 → `media.py:media_info` → `parse_media_key("neodb:tv.uuid")` → `async_recognize_media(source="neodb", ...)`。
+- **必须把 recognize 方法经 `get_module()` 注册为插件模块**（`_enabled` 即返回 `recognize_media`/`async_recognize_media`），不能依赖「媒体识别」子开关或 ChainBase 补丁。
+- 注册方法要**只处理本源**，其余返回 None 交还核心，否则抢在 TMDB/豆瓣前「赢者通吃」。
+- NeoDB 条目 `external_resources[]` 含 tmdb/douban/imdb 映射，正则提取写入 `MediaInfo.tmdb_id/douban_id/imdb_id`，否则订阅不可用。
+- 详情页增强：演员表走**免 token** `GET /api/catalog/{category}/{uuid}/credit/`；相似推荐走 `GET /api/catalog/item/{uuid}/similar`（**需 OAuth2 Bearer**，无 token 401），因 `MediaInfo` 无该字段，以文本块注入 `mi.overview` 显示。配置项 `neodb_token` 留空则只显示演员表。
 
-## 关键坑位固化（2026-07-31 增补）
+## 七、NeoDB 公开 API 能力边界（2026-07-31 实测）
 
-1. **用户 fork 镜像内置插件会 shadow Market 副本**：`ghcr.io/narrator-z/moviepilot:latest` 在 `/app/app/plugins/neodbsource/` 自带一份 neodbsource；Market 装的 `/config/plugins/neodbsource/` 与之同名（都 import 为 `app.plugins.neodbsource`），**实际加载的是 `/app/app` 内置那份**。改 Market 副本不生效——任何代码修复必须 docker cp 到 `/app/app/plugins/neodbsource/`（正在加载的），并顺手同步 `/config/plugins/neodbsource/` 保持一致，再清 `__pycache__` + `docker restart moviepilot`。
-2. **MediaInfo.year 是 str 不是 int**：详情端点带 response_model 校验，`item_to_mediainfo` 里 `mi.year = int(...)` 会触发 `ResponseValidationError` → HTTP 500（前端"出错啦"）。一律 `mi.year = str(year)`。
-3. **MediaType 枚举值是中文**：`MediaType.MOVIE.value == "电影"`，详情端点 `MediaType(type_name)` 要传中文；用 `MOVIE` 测会 ValueError（假 500）。
-4. **图片代理已在用户环境正确配置**：`IMAGE_PROXY_ALLOWED_PRIVATE_RANGES=["198.123.0.0/16","fdfe:dcba:9876::/64"]` 覆盖 clash fake-ip；neodb.social / doubanio / fanart 实测均可 fetch。测试时若硬传 `allowed_private_ranges=None` 会误报 non_global_dns_result——真实端点传的是 `settings.IMAGE_PROXY_ALLOWED_PRIVATE_RANGES`。
-5. **容器 settings.PROXY=None**：图片代理 `fetch_image` 直连不经代理；fake-ip 的 IPv6 段 `fdfe:dcba:9876::/64` 连接 Errno 101 失败，客户端回退 IPv4（198.123.0.0/16 经 clash 可达）→ 功能正常，无需处理。
-6. **列表缩略图优先取 poster_path**：`item_to_mediainfo` 若只设 `cover` 不设 `poster_path`，列表卡片可能显空白；已将 `poster_path` 兜底设为 neodb 封面。
+- 只有 `GET /api/trending/{category}/`（book/game/movie/music/performance/podcast/tv），**每类仅 60 条，第 2 页起完全重复** → 「看不到全部」的真正根因，非 bug 非鉴权。
+- **不存在** `/api/ranking/`、`/api/discover/`（404）。
+- `/api/catalog/search`（公开，query 必填，每页 20 真分页）：只能搜不能无关键词浏览。缺 query→422，空→400。
+- `/api/catalog/gallery/`（公开）：8 个策展合集，trending_movie/tv 与 trending 端点同一批，对影视零增量。
+- `/api/catalog/fetch`（url 取单条）、`/api/catalog/{type}/{uuid}/credit/`（演职员，公开）。
+- 鉴权仅开放 `me/tag/` 与 `similar`，**不提供 genre/年代/地区浏览**。
+- 结论：NeoDB 只能做 60 条精选；要全量+多维筛选必须换源（TMDB Discover / 豆瓣）。
 
-## NeoDB 公开 API 能力边界（OpenAPI schema 实测，2026-07-31）
-- **浏览端点只有 `GET /api/trending/{category}/`**：book/game/movie/music/performance/podcast/tv。**trending 全站仅 60 条/类，第 2 页起完全重复**（实测 movie 第2页 0 新增 60 重复）——这是"看不到全部"的真正根因，不是 bug、也不是缺鉴权。
-- **不存在 `/api/ranking/`、`/api/discover/`**：schema 里没有，公开访问 404。
-- **`/api/catalog/search`**（公开）：`query` 必填 + `category` + `page`，返回 `{count,data,pages}` 真分页每页 20；缺 query→422、空 query→400。只能"搜"不能无关键词浏览。插件已用此端点（neodbhelper.search 传 `query`）。
-- **`/api/catalog/gallery/`**（公开）：返回 8 个编辑策展合集完整 item 列表（original_episodes:90、trending_book:60、trending_movie:60、trending_tv:55、trending_game:51、trending_music:40、trending_podcast:28、trending_performance:15）。其中 trending_movie/tv 与 `/api/trending/movie|tv` **同一批 60/55 条**，对影视浏览零增量；original_episodes 是播客。故 gallery 也救不了"看全部"。
-- **`/api/catalog/fetch`**（公开，参数 `url`）：按 item URL 取单条详情，非浏览。
-- **`/api/catalog/{item_type}/{uuid}/credit/`**（公开）：某条目演职员，可给详情页加"演员表"。
-- **`/api/catalog/item/{uuid}/similar`**（**需鉴权 OAuth2 Bearer**）：相似推荐，可给详情页加"相关推荐"。
-- **鉴权方式**：标准 OAuth2（无个人令牌一键生成）：`POST /api/v1/apps` 拿 client_id/secret → 浏览器 `/oauth/authorize` → `/oauth/token` 换 token。鉴权只开放 `me/tag/`（你自己的标签）与 `similar`，**不提供任何 ranking/discover/genre/年代 浏览**。
-- **结论**：NeoDB 源定位就是 60 条 trending 精选；要真·全量 + genre/年代/地区筛选，必须换/加带这些能力的源（TMDB Discover / 豆瓣），鉴权无解。
+## 八、历史修复记录（要点）
 
-## Fork 关键约定：post_message 签名已变更（影响所有插件！）
-- 本 fork 的 `_PluginBase.post_message` 签名是 `post_message(self, channel: MessageChannel = None, mtype=None, title=None, text=None, image=None, link=None, userid=None, username=None, **kwargs)`，内部 `Notification(channel=channel, mtype=mtype, title=title, text=text, ...)`。
-- **禁止**再像老 MP 那样 `self.post_message(Notification(...))` —— 会把整个 Notification 对象当成第一个位置参数 `channel` 传入，触发 `ValidationError: Notification channel ... Input should be [...]`（即日志里「发送通知失败：1 validation error for Notification channel」）。
-- **正确写法**：`self.post_message(mtype=NotificationType.Plugin, title=..., text=..., source=self.plugin_name)`（channel 默认 None = 发给所有已配置渠道；source 经 **kwargs 透传进 Notification）。
-
-## ChineseSubFinder 修复（v6.0.2，2026-08-02）
-- **部署路径**：仅 fork 内置 `/app/app/plugins/chinesesubfinder/`（**无** `/config/plugins` 副本），修代码只 docker cp 这一个内置路径即可（不像 neodbsource 要双路径）。
-- **Bug 1（WARNING「发送通知失败」）**：即上面的 post_message 签名踩坑，`__notify` 旧式传 Notification 对象 → 改为关键字拆传。已在容器内用 `MessageChain.post_message(mtype=..., title=..., text=..., source=...)` 实测不再崩 channel 校验。
-- **Bug 2（ERROR「调用 API 失败 HTTP 500：open ... .nfo: no such file or directory」）根因 = 时序竞态，不是路径错**：
-  - CSF 的 `/api/v1/add-job` 要靠同目录 `.nfo`（Emby/Jellyfin 扫描生成）取 IMDb/TMDB id；MP 的 `TransferComplete` 事件一触发插件就立刻调 CSF，此时 `.nfo` 还没生成 → CSF 返回 500。`.nfo` 通常晚约 1 分钟出现，之后 CSF 自己又会把字幕下好（实测 S03E05 等 .zh.srt/.zh.ass 都在）。
-  - 修复：`__request_csf` 改为 **后台 daemon 线程**调用，对 5xx/网络异常做最多 5 次、间隔 20s 重试；仅「鉴权失败/路径在 CSF 端不可见/参数错」(4xx) 或重试耗尽才记 ERROR+通知。瞬时 5xx 只记 INFO「暂未就绪…重试」，不再刷屏。
-  - 关键事实：MP 容器 `/media` 挂 `/vol3/@appcenter/MoviePilot/docker/media`，CSF 容器 `/media` 挂 `/vol2/1000/Media/link`（两个不同的 NAS 卷，但逻辑路径都是 `/media/shows/...`）；插件传给 CSF 的 `physical_video_file_full_path` 在 CSF 侧能正确解析（字幕已下好即证明），故重试必能成功。
-- 验证：容器内 `加载插件：ChineseSubFinder 版本：6.0.2`，无加载失败；post_message 行为测试通过。
-
-## StuckDownloadGuard 新增「降级切换」(v1.1.0, 2026-08-05)
-- **部署路径**：仅 fork 内置 `/app/app/plugins/stuckdownloadguard/`（**无** `/config/plugins` 副本），修代码只 docker cp 这一个内置路径即可（同 chinesesubfinder）。
-- **用户诉求**：长期下载速度=0 应「降级切换」——降级=降优先级排至队尾；切换=换源重搜后替换原种子（解决无源卡死）。
-- **实现要点**：
-  - `__handle_stuck` 重写：每次卡顿先 `__demote_and_move_tail`（降级），再尝试 `__switch_source`（切换，每周期仅一次）；切换成功即移除原种子并停止追踪；切换失败且达 `max_retries` 则 `__escalate`（停止+清理，订阅源顺带重搜）。
-  - 订阅来源切换：`SubscribeChain().search(sid)` 重搜（MP 选最优种子）→ 成功后再 stop+remove 原种子 + 删历史。
-  - 非订阅来源切换：`SearchChain().search_by_title(title)` 跨**全部索引器**重搜 → 过滤（seeders>0 且非原种子同名）→ 取做种人最多者 → `DownloadChain().download_single(context=ctx, torrent_content=ti.enclosure, label=settings.TORRENT_TAG)` 添加 → 成功则 stop+remove 原种子。
-  - 新增配置 `switch_source`（默认 True，关闭则仅降级排队）。
-- **关键 API 实测**（本 fork）：
-  - `SearchChain.search_by_title(title, sites=None, cache_local=False) -> List[Context]`：跨所有索引器搜索；`Context.torrent_info` 为 `TorrentInfo`，含 `enclosure`（下载链接）、`seeders`、`title`。
-  - `DownloadChain.download_single(self, context, torrent_file=None, torrent_content=None, episodes=None, ..., label=None, ...)`：高层下载入口，内部自动处理下载目录/cookie/分类，`label=settings.TORRENT_TAG` 可打 MP 标签。
-  - `DownloadHistory` 字段：`id, title, year, tmdbid, imdbid, doubanid, type, seasons, episodes, torrent_name, ...` → 可用于回推媒体身份做重搜。
-  - 无独立 `ManualDownloadChain`；`IndexerOper`/`IndexerHelper` 在核心不可直接导入（站点列表由 indexer 插件如 jackettextend 提供），故非订阅重搜走 `SearchChain.search_by_title` 而非枚举站点。
-- **同修 post_message 签名 bug**：`__notify` 旧式 `self.post_message(Notification(...))` 在 fork 新签名下会把 Notification 当 channel 传 → channel 校验崩溃、所有通知失效；改为 `self.post_message(mtype=..., title=..., text=..., source=...)`。已容器内验证不再崩。
-- 验证：容器内 `加载插件：StuckDownloadGuard 版本：1.1.0`，无加载失败；post_message 关键字调用不再崩 channel；`get_form` 含 `switch_source` 默认 True；切换相关方法（mangled `__switch_source/__switch_nonsub/__history_mtype/__download_single`）均存在。
+- **ChineseSubFinder v6.0.2**：① 修 post_message 签名坑；② ERROR「调用 API 失败 HTTP 500: open ...nfo」根因是**时序竞态**（CSF 靠 Emby/Jellyfin 生成的 .nfo 取 id，TransferComplete 触发时 .nfo 未生成，约 1 分钟后才有）→ 改为后台线程 + 5xx/网络异常最多 5 次间隔 20s 重试，4xx 或耗尽才上报。
+- **StuckDownloadGuard v1.1.0**：新增「降级切换」——先降级排队尾，再换源（订阅走 `SubscribeChain().search(sid)`，非订阅走 `SearchChain().search_by_title(title)` 跨索引器取做种最多者 + `DownloadChain().download_single(context=..., torrent_content=..., label=settings.TORRENT_TAG)`），每卡顿周期仅切换一次，无效则停止清理。配置项 `switch_source` 默认 True。
+- 已发布：`NeoDBSource` v1.0.4、`ChineseSubFinder` v6.0.2、`StuckDownloadGuard` v1.1.0、`JackettExtend` v6.0.2、`ProwlarrExtend` v6.0.0、`JackettIndexer` v6.0.1、`LunaTVSource` v0.4.83、`SiteOpenSignup`。
