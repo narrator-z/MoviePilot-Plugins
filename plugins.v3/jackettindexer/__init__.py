@@ -48,9 +48,9 @@ class JackettIndexer(_PluginBase):
     plugin_name = "Jackett索引器"
     plugin_desc = "集成Jackett索引器搜索，支持Torznab协议多站点搜索。仅索引私有和半公开站点。"
     plugin_icon = "Jackett_A.png"
-    plugin_version = "6.0.0"
-    plugin_author = "Claude"
-    author_url = "https://github.com"
+    plugin_version = "6.0.1"
+    plugin_author = "narrator-z"
+    author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "jackettindexer_"
     plugin_order = 15
     auth_level = 2
@@ -73,7 +73,9 @@ class JackettIndexer(_PluginBase):
 
     # Domain identifier for indexer (matching reference implementation pattern)
     # Format: plugin_name.author
-    JACKETT_DOMAIN = "jackett_indexer.claude"
+    # 占位符必须与 plugin_author.lower() 完全一致，否则 replace 不命中会导致
+    # 所有索引器共用同一个 domain（署名变更时务必同步修改此处）
+    JACKETT_DOMAIN = "jackett_indexer.narrator-z"
 
     # Torznab namespace for XML parsing
     TORZNAB_NS = "http://torznab.com/schemas/2015/feed"

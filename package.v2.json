@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持 Jackett 站点资源",
     "labels": "索引器,Jackett",
-    "version": "6.0.1",
+    "version": "6.0.2",
     "icon": "Jackett_A.png",
     "author": "narrator-z",
     "level": 1,
     "history": {
+      "v6.0.2": "同步清单版本号与插件代码内的 plugin_version（此前清单停留在 6.0.1、代码已是 6.0.2，双字段不一致会导致市场反复提示更新）",
       "v1.0": "适配MoviePilot V2 版本",
       "v1.1": "修复已知问题",
       "v1.2": "修复已知问题",
@@ -82,6 +83,19 @@
       "v1.0.2": "修复点击探索页电影/剧集报错「未识别到媒体信息」：将 neodb: 源识别注册为插件模块（get_module），只要插件启用即可点击跳转，不再依赖「媒体识别」子开关；同时补全 douban_id/imdb_id 提取让详情更完整。探索分类精简为电影/剧集/动画，并在每个分类下新增「类型」(电视剧/单季) 与「排序」(热门/高分) 筛选器。移除不再需要的「媒体识别」子开关与 ChainBase 补丁。",
       "v1.0.1": "修复探索页 NeoDB 数据源空白：未提供关键词时改为返回该分类的 NeoDB 热门榜单（movie/tv/book/game/music 均公开可用，anime 归入 tv），避免点进标签即空白；推荐数据源逻辑不变。注意插件默认禁用，需在 MoviePilot 插件页手动启用后探索页/推荐页才会出现 NeoDB 标签页",
       "v1.0.0": "初始版本：对标 imdbsource，提供 NeoDB 探索数据源（关键词+类别搜索）、推荐数据源（热门游戏/科幻电影/动画剧集）、媒体识别增强（按名称回退搜索并解析 TMDB ID），以及 neodb: 媒体ID回链转换；支持自定义 NeoDB 实例地址与代理"
+    }
+  },
+  "JackettIndexer": {
+    "name": "Jackett索引器",
+    "description": "集成Jackett索引器搜索，支持Torznab协议多站点搜索。仅索引私有和半公开站点。",
+    "labels": "索引器,Jackett",
+    "version": "6.0.1",
+    "icon": "Jackett_A.png",
+    "author": "narrator-z",
+    "level": 1,
+    "history": {
+      "v6.0.1": "修正市场索引署名：作者由 Claude 改为仓库维护者 narrator-z，与其余插件保持一致，便于按作者检索；同步调整插件内域名占位符模板以匹配新署名，索引器域名生成逻辑与已注册站点不受影响。",
+      "v6.0.0": "补充 V2 市场索引条目：此前代码已存在于 plugins.v2/jackettindexer/，但未在 package.v2.json 登记，导致 V2 实例在市场中检索不到该插件。"
     }
   }
 }

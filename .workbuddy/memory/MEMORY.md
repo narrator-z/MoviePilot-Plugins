@@ -4,15 +4,23 @@
 
 1. **版本号双字段必须同步**：`__init__.py` 的 `plugin_version`（MP 实际加载/显示/日志用）与 `package.v2.json` 的 `version`（Market 更新比较用）每次发版都要一起改，保持一致。只改其一 → Market 更新后显示版本不变、且反复提示有更新。
 2. **本地 `py_compile` 查不出运行期未定义名称**：插件加载失败（如漏 import 枚举、`NameError`）只在 MP 容器实际加载时暴露。改完代码应在容器内验证：
-   `docker exec moviepilot-v2 python3 -c "from app.schemas.types import EventType, ChainEventType, ..."`
+   `docker exec moviepilot python3 -c "from app.schemas.types import EventType, ChainEventType, ..."`
 3. **排查"插件不显示/安装失败/不生效"的事实来源**：直接 SSH 上 NAS 查 `/config/logs/moviepilot.log` 的 `加载插件 X 失败` 行，不要猜网络/镜像/SSH。Market 安装失败时 MP 会把插件备份到 `/config/plugins_backup` 但不装回 `/config/plugins`，故表现为不显示。
 4. **容器镜像可能与本地源码版本不一致**：用户容器是 `ghcr.io/narrator-z/moviepilot:latest`（用户自己 fork 构建），导入路径、事件枚举以容器内为准，不要只信本地 `E:\github\MoviePilot`。
 
 ## NAS / 部署环境（实测可用）
 - SSH：`192.168.31.145:22022`，用户 `narratorz`，密钥 `~/.ssh/id_ed25519_1panel`。
-- MoviePilot 容器：`moviepilot-v2`；插件目录（挂载卷）`/config/plugins/<id>/`；备份 `/config/plugins_backup/`；日志 `/config/logs/moviepilot.log`。
-- 部署修复文件：本地 scp → `docker cp` 进容器 → `docker restart moviepilot-v2`；冷启动约 30–60s 后查日志。
-- 调试技巧：`docker exec moviepilot-v2 python3`（sys.path 含 /config/plugins）可直接 `import neodbsource` 验证；`PluginManager()`/`eventmanager.send_event` 直接 import 拿到的是未初始化实例，无法验证运行时源生成。
+- MoviePilot 容器：**`moviepilot`**（2026-09 重装后已改名，不再是 `moviepilot`）；插件目录（挂载卷）`/config/plugins/<id>/`；备份 `/config/plugins_backup/`；日志 `/config/logs/moviepilot.log`。代码 `/app/app`，**前端静态 `/public/assets/`**。
+- 部署修复文件：本地 scp → `docker cp` 进容器 → `docker restart moviepilot`；冷启动约 30–60s 后查日志。
+- 调试技巧：`docker exec moviepilot python3` 可直接 import 插件验证；`PluginManager()` 直接 import 拿到的是未初始化实例，无法验证运行时源生成。
+- 容器内验证市场/接口行为：`docker exec -i moviepilot python3 - < script.py`（stdin 送脚本）。注意应用工厂是 `/app/app/factory.py`，**`app.main` 的 app 只有 6 条路由，不能用于 TestClient**；版本号取 `app.runtime.version.get_app_version()`（不是 `app.utils.version`）。
+
+## 插件市场机制（v3.0.37 实测，2026-09-12）
+- `settings.VERSION_FLAG='v3'`，`get_compatible_version_flags()=['v3','v2']`；`PLUGIN_MARKET` 默认 74 个仓库，**本仓库排在最后一位**。
+- 索引文件选择：`package.{flag}.json`（有 flag）/ `package.json`（无 flag）。**本仓库 `package.json` 是空 `{}`** → 无 VERSION_FLAG 的实例解析出 0 个插件。
+- 跨仓库去重（`catalog.py:370-386`）：按插件 ID 去重，**版本号高者胜出** → LunaTVSource 本仓库 0.4.60 被 jxxghp 的 0.4.82 顶掉。
+- **市场页（`state=market`）会排除已安装且无更新的插件**（`catalog.py:509-520`）。这是「按作者搜索只剩 1 个」的真正原因，不是分页也不是 bug。
+- ⚠️ **旧结论「API 默认只返回 50 条」已作废**：`plugin.py:207` 现为 `max_results=None`（不传即全量）；仅在传了 `page`/`count` 时才分页（默认 50）。前端市场页实测 `get("plugin/",{params:{state:"market",force:e}})` 不带分页 → 全量。
 
 ## 已发布插件
 - `NeoDBSource`（探索/推荐/识别 NeoDB 数据源，v1.0.4）、`ChineseSubFinder`（v6.0.2）、`StuckDownloadGuard`（v1.1.0）、`JackettExtend`、`ProwlarrExtend`、`SiteOpenSignup`。
@@ -23,7 +31,7 @@
 - **相似推荐**：`GET /api/catalog/item/{uuid}/similar` **必须 OAuth2 Bearer token**（无 token → 401）。因 `schemas.MediaInfo` 无 recommend/similar 字段，相似条目以文本块 `🎬 NeoDB 相似推荐：` 注入 `mi.overview` 才能在详情页显示。
 - 新增配置项 `neodb_token`（密码框）：用户填入自己的 NeoDB OAuth access_token 后解锁相似推荐；留空则只显示演员表。
 - 演员 `character` 仅取 `character_name`（为空即空），不回退 role，避免详情页显示 "角色: actor" 这种脏数据。
-- 部署：scp → docker cp 到 `/app/app/plugins/neodbsource/`(内置,实际加载) 与 `/config/plugins/neodbsource/`(Market) 双路径 → 清 `__pycache__` → `docker restart moviepilot-v2`。
+- 部署：scp → docker cp 到 `/app/app/plugins/neodbsource/`(内置,实际加载) 与 `/config/plugins/neodbsource/`(Market) 双路径 → 清 `__pycache__` → `docker restart moviepilot`。
 
 ## 插件：让探索页自定义数据源的条目可点击跳转（关键机制）
 - 探索页点击条目 → 媒体详情页 `app/api/endpoints/media.py:media_info` → `parse_media_key("neodb:tv.uuid")` → `async_recognize_media(source="neodb", mediaid="tv.uuid")`。
@@ -34,7 +42,7 @@
 
 ## 关键坑位固化（2026-07-31 增补）
 
-1. **用户 fork 镜像内置插件会 shadow Market 副本**：`ghcr.io/narrator-z/moviepilot:latest` 在 `/app/app/plugins/neodbsource/` 自带一份 neodbsource；Market 装的 `/config/plugins/neodbsource/` 与之同名（都 import 为 `app.plugins.neodbsource`），**实际加载的是 `/app/app` 内置那份**。改 Market 副本不生效——任何代码修复必须 docker cp 到 `/app/app/plugins/neodbsource/`（正在加载的），并顺手同步 `/config/plugins/neodbsource/` 保持一致，再清 `__pycache__` + `docker restart moviepilot-v2`。
+1. **用户 fork 镜像内置插件会 shadow Market 副本**：`ghcr.io/narrator-z/moviepilot:latest` 在 `/app/app/plugins/neodbsource/` 自带一份 neodbsource；Market 装的 `/config/plugins/neodbsource/` 与之同名（都 import 为 `app.plugins.neodbsource`），**实际加载的是 `/app/app` 内置那份**。改 Market 副本不生效——任何代码修复必须 docker cp 到 `/app/app/plugins/neodbsource/`（正在加载的），并顺手同步 `/config/plugins/neodbsource/` 保持一致，再清 `__pycache__` + `docker restart moviepilot`。
 2. **MediaInfo.year 是 str 不是 int**：详情端点带 response_model 校验，`item_to_mediainfo` 里 `mi.year = int(...)` 会触发 `ResponseValidationError` → HTTP 500（前端"出错啦"）。一律 `mi.year = str(year)`。
 3. **MediaType 枚举值是中文**：`MediaType.MOVIE.value == "电影"`，详情端点 `MediaType(type_name)` 要传中文；用 `MOVIE` 测会 ValueError（假 500）。
 4. **图片代理已在用户环境正确配置**：`IMAGE_PROXY_ALLOWED_PRIVATE_RANGES=["198.123.0.0/16","fdfe:dcba:9876::/64"]` 覆盖 clash fake-ip；neodb.social / doubanio / fanart 实测均可 fetch。测试时若硬传 `allowed_private_ranges=None` 会误报 non_global_dns_result——真实端点传的是 `settings.IMAGE_PROXY_ALLOWED_PRIVATE_RANGES`。
