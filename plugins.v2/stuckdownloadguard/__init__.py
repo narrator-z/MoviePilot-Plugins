@@ -59,6 +59,9 @@ _QB_ACTIVE_STATES = {
 }
 # qBittorrent 排队状态（等待队列，不计入卡顿时长）
 _QB_QUEUED_STATES = {"queueddl"}
+# qBittorrent 异常状态：出错/文件丢失/未知。此类种子永远不会自己恢复，
+# 进度通常停在 0 或中途，属于「僵尸任务」，必须纳入接管（否则永远没人管）。
+_QB_FAULT_STATES = {"error", "missingfiles", "unknown"}
 # Transmission 活跃下载状态（status 为整数）：1 校验等待 2 校验中 4 下载中
 _TR_ACTIVE_STATES = {1, 2, 4}
 # Transmission 排队状态：3 下载待处理（排队）
@@ -76,7 +79,7 @@ class StuckDownloadGuard(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页
@@ -339,29 +342,32 @@ class StuckDownloadGuard(_PluginBase):
         return out
 
     @staticmethod
-    def __classify_state(dtype: str, raw_state) -> Tuple[bool, bool]:
+    def __classify_state(dtype: str, raw_state) -> Tuple[bool, bool, bool]:
         """
-        判断原始状态是否为「活跃下载中」/「排队中」。
-        :return: (is_active, is_queued)
+        判断原始状态是否为「活跃下载中」/「排队中」/「异常（出错·缺文件·未知）」。
+        异常态种子不会自己恢复，等同卡死，需纳入接管（否则成为永远没人管的僵尸任务）。
+        :return: (is_active, is_queued, is_fault)
         """
         if dtype == "qbittorrent":
             st = str(raw_state or "").lower()
             if st in _QB_QUEUED_STATES:
-                return False, True
+                return False, True, False
             if st in _QB_ACTIVE_STATES:
-                return True, False
-            return False, False
+                return True, False, False
+            if st in _QB_FAULT_STATES:
+                return False, False, True
+            return False, False, False
         if dtype == "transmission":
             try:
                 st = int(raw_state)
             except (TypeError, ValueError):
-                return False, False
+                return False, False, False
             if st in _TR_QUEUED_STATES:
-                return False, True
+                return False, True, False
             if st in _TR_ACTIVE_STATES:
-                return True, False
-            return False, False
-        return False, False
+                return True, False, False
+            return False, False, False
+        return False, False, False
 
     @staticmethod
     def __source_of(history) -> Optional[str]:
@@ -417,10 +423,11 @@ class StuckDownloadGuard(_PluginBase):
                         continue
 
                 seen.add(h)
-                active, queued = self.__classify_state(t["type"], t["raw_state"])
-                # 卡顿判定：活跃下载中且下载速度=0（不含排队时间）即视为卡死，
+                active, queued, fault = self.__classify_state(t["type"], t["raw_state"])
+                # 卡顿判定：活跃下载中「或」已处于异常态（error/缺文件/未知）且下载速度=0 即视为卡死，
                 # 不再区分进度——0 进度卡住与中途卡住（如下到一半却 0 速度）同样接管。
-                stuck = active and t["dl_speed"] <= 0
+                # 排队中不计入；异常态必须接管，否则会成为永远没人处理的僵尸任务。
+                stuck = (active or fault) and t["dl_speed"] <= 0
 
                 rec = self._states.get(h)
                 if not rec:
@@ -470,8 +477,14 @@ class StuckDownloadGuard(_PluginBase):
             仅当「重试窗口用尽」才动用换源/清理，避免瞬时抖动即重搜。
         """
         rec["retries"] = rec.get("retries", 0) + 1
+        _a, _q, fault = self.__classify_state(t["type"], t["raw_state"])
         is_zero = t["progress"] < _PROGRESS_ZERO_THRESHOLD
-        phase = "0 进度卡住" if is_zero else f"中途卡住（{t['progress']:.1f}%）"
+        if fault:
+            phase = f"异常状态（{t['raw_state']}，出错/缺文件）"
+        elif is_zero:
+            phase = "0 进度卡住"
+        else:
+            phase = f"中途卡住（{t['progress']:.1f}%）"
 
         # 1) 降级：降优先级并排至下载队列队尾
         self.__demote_and_move_tail(clients, t["downloader"], hash_str)

@@ -283,6 +283,32 @@ check("H3 状态字典不再含 switch_attempted 残留字段",
 
 print()
 print("=" * 74)
+print("I. 异常态（error / missingFiles）僵尸任务也必须被接管")
+print("=" * 74)
+# 现场实证：qBittorrent 里 2 个 error + 1 个 missingfiles 常年停在 0%，
+# 旧版因不在 _QB_ACTIVE_STATES 内而永远无人处理。
+for st in ["error", "missingfiles", "unknown"]:
+    g = make_guard()
+    setattr(g, "_StuckDownloadGuard__collect",
+            lambda s=st: ([torrent(progress=0.0, speed=0, state=s)], {}))
+    g.monitor()
+    check(f"I-{st} 异常态被接管", len(g.calls["notify"]) == 1, str(g.calls["notify"]))
+    if g.calls["notify"]:
+        check(f"I-{st} 文案标注异常状态", "异常状态" in g.calls["notify"][0]["extra"],
+              g.calls["notify"][0]["extra"])
+
+print()
+print("=" * 74)
+print("J. 已完成做种(stoppedup)不应被误伤（现场 281 个此类）")
+print("=" * 74)
+g = make_guard()
+setattr(g, "_StuckDownloadGuard__collect",
+        lambda: ([torrent(progress=100.0, speed=0, state="stoppedup")], {}))
+g.monitor()
+check("J1 stoppedup 不进入监控", g._states == {} and g.calls["notify"] == [], str(g._states))
+
+print()
+print("=" * 74)
 print(f"结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
 print("=" * 74)
 if FAIL:
