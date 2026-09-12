@@ -76,9 +76,20 @@
 
 - **v2/v3 必须逐行一致**（该插件两端完全同源，无 v3 特有适配）；无内部 package.json。
 - 宿主接口（容器内实测对齐）：`SubscribeChain().search(sid=)` / `.get_subscribe_by_source()`、`SearchChain().search_by_title(title=, sites=None, cache_local=False)`、`DownloadChain().download_single(context=, torrent_content=, label=)`、`DownloadHistoryOper().get_by_hashes/get_by_hash/delete_history`（返回 `Dict[str,DownloadHistory]`，**PK=`id`**）、`SystemConfigOper().get(SystemConfigKey.Downloaders)`、`settings.TORRENT_TAG`。
-- **1.1.1 行为（重试 → 换源 → 清理）**：
-  - 卡顿判定 `stuck = active and dl_speed <= 0`（**不区分进度**：0 进度与中途卡住同样接管）。`is_zero` 仅用于通知文案。
-    暂停 `pausedDL`/排队 `queueddl`/做种不在 `_QB_ACTIVE_STATES` 内 → 不误伤。
+- **1.1.2 行为（异常态也接管）**：
+  - 卡顿判定 `stuck = (active or fault) and dl_speed <= 0`（**不区分进度**：0 进度与中途卡住同样接管）。
+    `fault` = 新增 `_QB_FAULT_STATES = {error, missingfiles, unknown}` —— 这类种子不会自己恢复，
+    旧版因不在 `_QB_ACTIVE_STATES` 内而成为**永远没人管的僵尸任务**（现场实测 2 个 error + 1 个 missingfiles 停了 1 个月+）。
+    `__classify_state` 返回三元组 `(is_active, is_queued, is_fault)`。
+  - **`stoppedup`（已完成做种、100%）不误伤** —— 现场 281/285 属于此类，别当成卡住。
+  - 暂停 `pausedDL`/排队 `queueddl`/做种不在活跃状态集内 → 不误伤。
+- **⚠️ 排查「下载中不动」的正确姿势**（2026-09-12 实证，别猜）：
+  1. 查插件副本版本（`/app/app/plugins/<id>/` 有没有 .pyc = 是否真加载）；
+  2. 查 `systemconfig` 里 `plugin.<ID>` 的 `enabled`/`cron`/`only_subscribe`；
+  3. 查 `plugindata` 里 `torrent_states`（`{}` = 监控跑过但没种子进监控）；
+  4. **直连下载器列 state × 进度交叉表**（`dl_info_speed=0` 时先看是不是根本没在下载）。
+  ⇒ 另注意：**下载守卫只管 qBittorrent/Transmission 里的种子，管不到 LunaTVSource 的 m3u8 下载**（那是另一条通道，有自己的换源）。
+  ⇒ `only_subscribe=true` 会把无 `Subscribe|` 来源的卡死种子全部跳过（下载历史常少于种子数，很多查不到来源）。
   - 每轮降级排尾（重试窗口）；`retries >= max_retries` 才调 `__switch_source`（订阅走订阅链重搜、非订阅跨索引器重搜更优种子并替换）；换源失败才 `__escalate`（停止清理，订阅源顺带重搜）。
   - **已移除 `switch_attempted` 一次性标记**（旧版置 True 后永不重置 → 首次瞬时失败就再也不换源）。旧持久化残留该字段无害。
 - 单测 `.workbuddy/sdg_stuck_test.py`（21 用例全过）。
