@@ -941,7 +941,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "lunatvsource.png"
-    plugin_version = "0.4.90"
+    plugin_version = "0.4.91"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "lunatvsource_"
@@ -5596,6 +5596,11 @@ class LunaTVSource(_PluginBase):
                         association,
                         season,
                     )
+                    # 本分支只在局部持有 CmsEpisode 对象；共享的
+                    # episode_candidates 是 url 字符串表（可能已由
+                    # _collect_episode_candidates 填入跨源候选），混入
+                    # 对象会让后面的 .url 访问在 str 上崩溃。
+                    season_episode_map: Dict[Tuple[int, int], List[CmsEpisode]] = {}
                     for episode in result.episodes:
                         if season > 0 and episode.season != season:
                             continue
@@ -5603,13 +5608,13 @@ class LunaTVSource(_PluginBase):
                             continue
                         if total_episode > 0 and episode.episode > total_episode:
                             continue
-                        episode_candidates.setdefault(
+                        season_episode_map.setdefault(
                             (int(episode.season), int(episode.episode)), []
                         ).append(episode)
 
                     conflict_urls: List[str] = []
                     unique_candidates: Dict[Tuple[int, int], List[CmsEpisode]] = {}
-                    for key, candidates in episode_candidates.items():
+                    for key, candidates in season_episode_map.items():
                         seen_urls: set[str] = set()
                         unique_candidates[key] = []
                         for candidate in candidates:
