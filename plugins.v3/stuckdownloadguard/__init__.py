@@ -3,10 +3,12 @@
 下载守卫（StuckDownloadGuard）
 
 监控下载管理模块中的下载任务：
-  - 若某下载任务「进度≈0 且 下载速度=0（不含排队时间）」持续达到设定时长（默认 30 分钟），
+  - 若某下载任务「活跃下载中且 下载速度=0（不含排队时间）」持续达到设定时长（默认 30 分钟），
     则降低其优先级并排至下载队列队尾；
-  - 若连续多次（默认 3 次）仍无进展，则停止种子、清理下载任务，并尝试重新搜索下载
-    （订阅来源的下载会通过订阅链重新搜索，非订阅来源仅做停止与清理）。
+    注：进度≈0 或中途卡住（如下到一半却 0 速度）均视为卡死，同样接管。
+  - 连续多次（默认 3 次）降级重试仍无进展（重试无效），则停止种子、清理下载任务，并尝试重新搜索并切换下载源
+    （订阅来源通过订阅链重新搜索、非订阅来源跨索引器重搜更优种子并替换原种子）；
+  - 若切换下载源不可用，则仅停止并清理（订阅来源仍会顺带重新搜索）。
 
 说明：
   - 为准确区分「排队中」与「下载中」，本插件直接调用下载器原生客户端（qBittorrent / Transmission）
@@ -70,11 +72,11 @@ class StuckDownloadGuard(_PluginBase):
     # 插件名称
     plugin_name = "下载守卫"
     # 插件描述
-    plugin_desc = "监控下载任务，长时间无进度则降级排至队尾，连续无效则停止并重新搜索"
+    plugin_desc = "监控下载任务，长时间无速度则降级排至队尾重试，重试无效则切换下载源/清理"
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页
@@ -416,7 +418,9 @@ class StuckDownloadGuard(_PluginBase):
 
                 seen.add(h)
                 active, queued = self.__classify_state(t["type"], t["raw_state"])
-                stuck = active and t["progress"] < _PROGRESS_ZERO_THRESHOLD and t["dl_speed"] <= 0
+                # 卡顿判定：活跃下载中且下载速度=0（不含排队时间）即视为卡死，
+                # 不再区分进度——0 进度卡住与中途卡住（如下到一半却 0 速度）同样接管。
+                stuck = active and t["dl_speed"] <= 0
 
                 rec = self._states.get(h)
                 if not rec:
@@ -426,7 +430,6 @@ class StuckDownloadGuard(_PluginBase):
                         "active_stuck": 0.0,
                         "last_ts": None,
                         "retries": 0,
-                        "switch_attempted": False,
                     }
                     self._states[h] = rec
 
@@ -457,46 +460,54 @@ class StuckDownloadGuard(_PluginBase):
 
     def __handle_stuck(self, hash_str: str, rec: dict, t: dict, clients: Dict[str, dict]):
         """
-        达到卡顿时长后的处理：先降级排至队尾，再尝试「切换下载源/种子」
-        （重新搜索更优种子并替换原种子）；若切换不可用且连续多次仍无效，则升级为停止/清理。
+        达到卡顿时长后的处理（重试 → 换源 → 清理）：
+          1) 降级：降优先级并排至下载队列队尾（先腾出带宽/队列，给其它下载让路）；
+          2) 重试窗口：连续多次（默认 3 次）仍无进展，视为「重试无效」；
+          3) 重试无效 → 「切换下载源/种子」：通知 MoviePilot 重新搜索并替换原种子
+             （订阅来源走订阅链重搜、非订阅来源跨索引器重搜更优种子并替换）；
+          4) 若切换不可用或失败，则升级为停止/清理（订阅源会顺带重新搜索）。
+        注：卡顿判定不再区分进度，0 进度卡住与中途卡住同样适用；
+            仅当「重试窗口用尽」才动用换源/清理，避免瞬时抖动即重搜。
         """
         rec["retries"] = rec.get("retries", 0) + 1
-        # 1) 降级：降优先级并排至下载队列队尾（避免抢占正常下载的带宽/队列）
+        is_zero = t["progress"] < _PROGRESS_ZERO_THRESHOLD
+        phase = "0 进度卡住" if is_zero else f"中途卡住（{t['progress']:.1f}%）"
+
+        # 1) 降级：降优先级并排至下载队列队尾
         self.__demote_and_move_tail(clients, t["downloader"], hash_str)
 
-        # 2) 切换下载源：每个卡顿周期仅尝试一次，避免每次都重搜
+        # 2) 尚未到重试上限：重置计时，开启下一轮观察窗口（让下载器排队喘息，先重试）
+        if rec["retries"] < self._max_retries:
+            rec["active_stuck"] = 0.0
+            rec["last_ts"] = time.time()
+            self.__notify(
+                action="降级并排至队尾（重试中）",
+                title=rec.get("title"),
+                hash_str=hash_str,
+                extra=f"状态：{phase}；已连续卡住 {rec['retries']} 次"
+                      f"（达到 {self._max_retries} 次将尝试切换下载源）",
+            )
+            return
+
+        # 3) 重试无效 → 尝试切换下载源（通知 MP 重新搜索并替换原种子）
         switched = False
-        if self._switch_source and not rec.get("switch_attempted"):
+        if self._switch_source:
             switched = self.__switch_source(hash_str, rec, t, clients)
-            rec["switch_attempted"] = True
-
-        # 3) 判定：已切换成功 → 停止追踪原种子（原种子将被移除，新种子下一轮单独监控）
         if switched:
+            # 换源成功：原种子已被移除，停止追踪（新种子由 MP 接管并单独监控）
             self._states.pop(hash_str, None)
             return
 
-        # 4) 切换失败且已达最大降级次数 → 升级为停止/清理（订阅源会顺带重新搜索）
-        if rec["retries"] >= self._max_retries:
-            self.__escalate(clients, t["downloader"], hash_str, rec)
-            self._states.pop(hash_str, None)
-            return
-
-        # 5) 未达上限：重置计时，开启下一轮观察窗口
-        rec["active_stuck"] = 0.0
-        rec["last_ts"] = time.time()
-        self.__notify(
-            action="降级并排至队尾（暂未切换源）",
-            title=rec.get("title"),
-            hash_str=hash_str,
-            extra=f"已连续卡住 {rec['retries']} 次（达到 {self._max_retries} 次将停止并清理）",
-        )
+        # 4) 换源失败/不可用 → 升级为停止并清理（订阅源顺带重新搜索）
+        self.__escalate(clients, t["downloader"], hash_str, rec)
+        self._states.pop(hash_str, None)
 
     def __switch_source(self, hash_str: str, rec: dict, t: dict, clients: Dict[str, dict]) -> bool:
         """
-        尝试「切换下载源/种子」：为长期0速度的种子寻找更优替代源并替换。
+        尝试「切换下载源/种子」：为持续 0 速度（0 进度或中途卡住）的种子寻找更优替代源并替换。
           - 订阅来源：通过订阅链重新搜索（MoviePilot 会挑选最优可用种子）；
           - 非订阅来源：按媒体身份跨索引器重搜，选取做种人更多的替代种子后添加并移除原种子。
-        返回 True 表示已成功切换（原种子将被移除），False 表示本次无法切换。
+        返回 True 表示已成功切换（原种子将被移除），False 表示本次无法切换（调用方会升级为停止/清理）。
         """
         history = None
         try:
@@ -890,7 +901,7 @@ class StuckDownloadGuard(_PluginBase):
                                         'label': '卡顿时长(分钟)',
                                         'type': 'number',
                                         'placeholder': '30',
-                                        'hint': '进度≈0且下载速度为0（不含排队时间）持续达到该时长后降级'
+                                        'hint': '下载速度为0（0 进度或中途卡住均计）持续达到该时长后降级重试'
                                     }
                                 }]
                             }
@@ -933,7 +944,7 @@ class StuckDownloadGuard(_PluginBase):
                                     'props': {
                                         'model': 'switch_source',
                                         'label': '自动切换下载源',
-                                        'hint': '长期0速度时自动重新搜索更优种子并替换原种子（降级+换源）；关闭则仅降级排队'
+                                        'hint': '重试无效后自动通知 MP 重新搜索更优种子并替换原种子（降级+换源）；关闭则仅降级重试、达上限停止清理'
                                     }
                                 }]
                             }
@@ -980,9 +991,10 @@ class StuckDownloadGuard(_PluginBase):
                                         'type': 'info',
                                         'variant': 'tonal',
                                 'text': '仅处理带 MoviePilot 标签的种子。下载器需为 qBittorrent 或 Transmission。'
-                                        '长期0速度时：先「降级」排至队尾，再「切换下载源」——'
+                                        '持续 0 速度（0 进度或中途卡住均计）时：先「降级」排至队尾重试，'
+                                        '连续多次无效（默认 3 次）后再「切换下载源」——'
                                         '订阅来源走订阅链重搜、非订阅来源跨索引器重搜更优种子并替换原种子；'
-                                        '若切换不可用且连续多次无效，则停止并清理（订阅源会顺带重新搜索）。'
+                                        '若切换不可用，则停止并清理（订阅源会顺带重新搜索）。'
                                     }
                                 }]
                             }
