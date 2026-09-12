@@ -11,13 +11,22 @@
 5. 插件不显示/装不上：查 `/config/logs/moviepilot.log` 的「加载插件 X 失败」；Market 安装失败的文件会留在 `/config/plugins_backup`。
 6. **fork 镜像内置插件 shadow Market 副本**：`/app/app/plugins/<id>/` 优先于 `/config/plugins/<id>/`，改代码要 docker cp 到内置路径。
 7. **post_message 新签名**：只能 `post_message(mtype=..., title=..., text=..., source=...)`；禁止传 Notification 对象（会被当 channel 传入而崩溃）。
+8. **v2/v3 同名插件必须逐行 diff 对齐**（v3 特有适配除外）。`2028bf9` 提交信息写"v2/v3 同改"，实际 v3 只改了**函数签名 + 调用点**、**函数体漏改** → 修复从未生效、三天无人发现（已于 `9470f54` 修，版本 6.0.3）。
+   发版前必做：`diff <(tr -d '\r' < plugins.v2/<p>/__init__.py) <(tr -d '\r' < plugins.v3/<p>/__init__.py)`（**必须 `tr -d '\r'`**，否则 core.autocrlf 让全文件被判为差异）+ 跑 `.workbuddy/repo_audit.py`。
+   ⚠️ **定性别急着上 P0**：该漏改实测**无功能影响**（见第 11 条 torznab 鉴权），属"一致性 + 潜在风险"级 P1。发现漏改要先做**影响面实测**再定级。
+9. **「签名收了参数、函数体却不用」是最危险的半截改动**（读签名觉得传了、读调用点觉得拿到了，只有函数体知道它扔了）。用 `.workbuddy/unused_arg_scan.py`（AST）扫。
+   判据：**只有 v2 用了 / v3 没用才算 bug**；v2/v3 成对出现的属宿主接口签名约定（`search_torrents(page/cat)`、`refresh_torrents(keyword/cat/mtype)`、`recognize_media(mtype)`、`media_path(root)`、`cleanup_task(output_parent)` 均已确认为无害）。
+10. **验证"代码改了没生效"要直查容器**：`docker exec moviepilot grep -n <新行特征> /app/app/plugins/<id>/<file>`。市场落点就是 `/app/app/plugins/<id>/`（`/config/plugins/<id>/` 只是数据目录）。
+11. **Jackett torznab 只认 query 里的 `apikey`，cookie / header 一律无效**（2026-09-12 鉴权矩阵实测）。
+    ⇒ 任何"补 cookie/header 才能搜"的假设都要先实测；`RequestUtils(headers=…, cookies=…)` 传了也不影响结果。
+    判定某鉴权改动有没有用，唯一判据是**直接发请求对比响应**，不是读代码。
 
 ## 二、仓库与插件市场
 
 - 三份索引：`package.json`（无 VERSION_FLAG 实例读）、`package.v2.json`、`package.v3.json`；Market 按插件 ID 跨仓库去重、**版本高者胜出**。
 - 市场页会排除「已安装且无更新」的条目 → 看到条数少于清单是正常的，不是 bug。
 - 发版校验脚本必做：比对 清单 version/author ↔ 代码 `plugin_version`/`plugin_author` ↔ 目录集合；正则用 `^\s*字段名\s*=`（类变量有缩进）。
-- 已发布：LunaTVSource 0.4.85(OneBigMoon)、ChineseSubFinder 6.0.2、StuckDownloadGuard 1.1.0、JackettExtend 6.0.2、ProwlarrExtend 6.0.0、JackettIndexer 6.1.0、NeoDBSource 1.0.4、SiteOpenSignup。
+- 已发布：LunaTVSource 0.4.86(OneBigMoon)、ChineseSubFinder 6.0.2、StuckDownloadGuard 1.1.0、JackettExtend 6.0.3、ProwlarrExtend 6.0.0、JackettIndexer 6.1.0、NeoDBSource 1.0.4、SiteOpenSignup。
 - 清单条目 key 是**首字母大写**的插件名（`LunaTVSource`），不是目录名 `lunatvsource`；改清单时按 `      "0.4.8x": `（6 空格缩进）定位 history 行，最后一条 history 需要补尾逗号。
 
 ## 三、LunaTVSource（fork 维护）
@@ -67,13 +76,84 @@
 - 从 `external_resources[]` 提取 tmdb/douban/imdb 写入 `MediaInfo`，否则订阅不可用。
 - 公开 API 只有 `trending/{category}`（每类 60 条、第 2 页起重复）、`catalog/search`、`gallery/`、`fetch`、`credit`；无 ranking/discover、无维度浏览。
 
-## 七、其他坑位
+## 七、transferhistory 历史同步与空间核算（2026-09-12 实证）
+
+- 存量文件归位/搬迁后，`transferhistory.dest` **不会自动更新**，要手动重写：
+  `/media/link/animes/国漫/<条目>` → `/media/link/shows/<该行 category>/<条目>`（category 列本身就是对的，按行推导即可）。
+- 文件名三态：`exact`（同名还在）/ `rematched`（归位时同集被替换 → 在同季目录按 `SxxExx` 找真实文件）/ `missing`（已进回收区）。
+  `dest_fileitem` 的 path/name/basename/extension/size/modify_time 必须与 dest 一起改。实测 122 行：34/88/0。
+- **只改 dest 侧**；`src`、`downloadhistory.path`、`downloadfiles.*`、`transfersettlementreceipt.src` 是下载侧事实，改了就成伪造。
+  `systemconfig.Directories` 是目录配置本身、`mediaserveritem.path` 是 Emby 同步缓存，都不该动。
+- ⚠️ **`du -sh a b c` 跨参数按 inode 去重**：库是 link 模式与下载源同 inode，一起统计会严重低估（实测 58G 被报成 16G）。**多目录占用必须逐个单独 du**。
+- 💡 回收区能释放的空间远小于表面值：`/media/_recycle_20260912` 47.2G 中仅 **4.3G 独占**，**42.9G 与下载源共享 inode**
+  → 只删回收区几乎不腾空间，要回收必须连下载源一起清（link 模式下清源不影响库）。
+- 查询"某路径还有谁引用"：遍历 `sqlite_master` 各表各列 `CAST(col AS TEXT) LIKE '%路径片段%'`，比逐表翻可靠。
+
+## 八、订阅「搜到资源但下不动」= 先查下载器开关（2026-09-12 实证）
+
+- 症状：订阅/搜索有结果，但没有任何下载动作；`downloadfailure` 里成片 `error_message = 未找到下载器`。
+- 根因入口：`systemconfig` 的 **`Downloaders`** 里目标下载器的 **`enabled: false`**（可能还伴随 `default: false`）。
+  取不到可用下载器时 `app/chain/download/submission.py:500` 直接返回「未找到下载器」。
+- ⚠️ **自带下载通道的插件不受影响**：LunaTVSource 走自己的 m3u8 直下 + 自整理，不经下载器
+  → 表现为「插件在动、种子订阅全停」，极易误判成插件故障。**先看 `Downloaders` 再看插件。**
+- 排查顺序：`downloadfailure` 按 `error_message` 聚合 → `systemconfig.Downloaders` 看 `enabled` →
+  用 curl 直连下载器验证服务本身（qBittorrent：`/api/v2/app/version?apikey=…` 返版本即在线）。
+- **改 `systemconfig` 后必须 `docker restart moviepilot`**（内存缓存），改前先 `cp /config/user.db /config/user.db.bak-<用途>-<日期>`。
+
+## 九、清理释放量按 inode 核算，别按目录大小
+
+- 库（link 模式）与下载源是**同一 inode 的硬链接** → 只删一侧不释放空间。
+- 判定：候选集合内每个 inode，若**候选之外无引用**（`nlink - 候选内出现次数 == 0` 且不在保留集合）才会真释放。
+- 实测：回收区 47.17G + 旧源 57.42G（表面 104.6G），**同时删**只释放 **约 42G**；
+  旧源里 15.3G 与库共享，删源后库仍引用 → 永久不释放（磁盘上本就只占一份）。
+- **活动下载目录绝不能整个删**（如 LunaTVSource 的 `download_root=/media/m3u8`）。脚本必须显式排除。
+
+## 十、LunaTVSource「下载失败自动换源」（0.4.86 已实现）
+
+### 实现要点（改 3 处，`__init__.py` + `downloader.py`）
+
+- **配置**：`source_fallback`（VSwitch，默认**开**；旧配置缺键按开处理）、
+  `fallback_max_sources`（VTextField 0–5，默认 **2**，`0` = 关闭换源）。
+  读取侧 `_source_fallback_enabled()` / `_fallback_max_sources()` 都带缺键/坏值兜底。
+- **候选表必须建在 `matching_results[:1]` 截断【之前】**（`__init__.py` ≈5507–5513）：
+  `_collect_episode_candidates()` 把每一集在**全部**匹配源上的播放地址收成 `{(season,episode): [url,…]}`（同址去重保序）。
+  截断后只剩排名第一的源，备选地址会在那一行被永久丢弃 —— 这是整个功能唯一的"位置敏感"点。
+- **入队带候选**：构造 `DownloadTask` 时剔除当前 `url`、截断到上限，写 `task.alt_urls`。
+- **失败轮转**：`_finish_failed` 开头，`control.action == ""`（**非**用户暂停/删除）时调
+  `_requeue_with_fallback(task, error)`：把当前 url 记入 `failed_urls`，取 `alt_urls` 中第一个未试过的地址，
+  置 `pending` + 换 `url`，`progress/attempts/output/downloaded_bytes/download_engine` 全部复位。
+- **幂等且有界**：每个 url 至多尝试一次（`failed_urls` 去重集合）；候选耗尽才写终态 `failed`，
+  失败通知带「（已尝试 N 个源均失败）」。换源中途是另一条通知「LunaTV 自动换源」，
+  正文只打印 host（`_url_host`），**不泄露完整播放链接**。
+- **`enqueue()` 复用失败任务时也换源**：先 `_merge_fallback_urls` 并入本次扫描新发现的备选，再取下一个未试地址，
+  而不是照抄那个已知失效的 URL。
+- **数据兼容**：`DownloadTask` 新增 `alt_urls` / `failed_urls`（`default_factory=list`），
+  `_download_task_from_payload` 校验必须是 `str` 列表，老记录缺字段即空列表 = 无备选 = 旧行为。
+- **仅 `source_strategy` 非 `all` 时生效**：`all` 本身多源并行入队，不存在"换"；且 `all` 下
+  `source_key = result.source_key` → `identity_key` 源相关，不同源本就是不同任务。
+- **L1 单测**：`.workbuddy/luna_fallback_test.py`，28 用例（I1 同 identity 不新增任务 / I2 每候选至多一次 /
+  I3 耗尽才终态 / I5 老记录兼容 / I6 重启不丢进度）。默认导入**仓库源码**；容器内验证改后副本设 `LUNA_SRC=/tmp/luna_new`。
+
+### 为什么必须这么改（旧版行为与误判清单）
+
+- 旧版失败链路：`_finish_failed` 只置 `state=failed` + 通知，**无换源分支**。
+- ⭐ **失败任务复用 ≠ 换源**：`enqueue()` 本可把 failed 重置为 pending 并写新 URL，但
+  `_rank_subscription_results` 排序键（新季>集数>分辨率>原始顺序）**完全确定性、不含失败因子**，
+  ⇒ 每轮算出同一名次、同一 URL。线上实测**重试 31 次仍是同一主机** = 无换源的铁证。
+- 易被误认成换源的机制（都不是）：m3u8 列表 `range(2)` 同 URL 重试（**403 不可重试**）、
+  `--download-retry-count 3`、多引擎回退 `for engine in self._m3u8_engines`（**只注册 1 个引擎**，空架子）、
+  写库 `range(2)`、`fallback_sources.json`（源清单离线兜底）、`_rank_subscription_results`（**下载前**择优）。
+  `downloader.py:1685` 的「using ffmpeg」是遗留误导文案。
+- 源列表在 `plugindata.luna_source_config_v1`（值是**列表**，元素 `key/name/api/detail`）；
+  CMS 接口：搜索 `?ac=list&wd=&pg=`、详情 `?ac=detail&ids=`；`vod_play_url` 用 `$$$` 分线路、`#` 分集、`$` 分名称/URL。
+
+## 十一、其他坑位
 
 - `MediaInfo.year` 是 **str**（`int()` 会触发 response_model 校验 500）；`MediaType` 枚举值是**中文**（`MediaType.MOVIE.value == "电影"`）。
 - 列表缩略图优先取 `poster_path`（只设 `cover` 会空白）。
 - 图片代理已配 `IMAGE_PROXY_ALLOWED_PRIVATE_RANGES` 覆盖 clash fake-ip，测试时别硬传 None。
 
-## 八、媒体库存量归位（2026-09-12 已执行）
+## 十二、媒体库存量归位（2026-09-12 已执行）
 
 - **审计金标准**：`transferhistory` 同表存 `category`（MP 算出的正确分类）与 `dest`（实际落盘）。
   `category` 与 `dest` 前缀不一致 = 该次整理落盘错了。查"整理对不对"**先跑这个一致性比对**，
