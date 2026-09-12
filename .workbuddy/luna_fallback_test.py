@@ -214,6 +214,65 @@ check("无候选时复用仍用原 url（回归）",
 
 print()
 print("=" * 72)
+print("E. 跨源活链解析器接缝（增强换源覆盖）")
+print("=" * 72)
+
+# 解析器在被调用时应拿到 task，并返回活链列表；调用方会剔除已试过的。
+def fake_resolver(t):
+    return ["http://live1/1.m3u8", "http://live2/2.m3u8"]
+
+
+qe, statee = make_queue()
+task_e = seed(statee, "http://a/1.m3u8", [], failed=["http://a/1.m3u8"])
+qe._fallback_resolver = fake_resolver
+ok_e = qe._requeue_with_fallback(task_e, "HTTP 403")
+row_e = statee["tasks"][0]
+check("无入队候选时，跨源解析器注入活链并切到 live1", ok_e and row_e["url"] == "http://live1/1.m3u8", row_e)
+check("解析器注入后任务退回 pending（非终态）", row_e["state"] == "pending", row_e["state"])
+check("已试地址 a 进入 failed_urls（I2 不变式仍成立）", "http://a/1.m3u8" in row_e["failed_urls"], row_e)
+check("live2 留在 alt_urls 待下次轮转", "http://live2/2.m3u8" in row_e["alt_urls"], row_e)
+
+# 解析器返回的活链若已全部试过，应终止（不再无限重搜）
+qe2, statee2 = make_queue()
+task_e2 = seed(statee2, "http://a/1.m3u8", [], failed=["http://a/1.m3u8"])
+qe2._fallback_resolver = lambda t: ["http://a/1.m3u8"]  # 只返回已试过的死链
+ok_e2 = qe2._requeue_with_fallback(task_e2, "HTTP 403")
+check("解析器只返回已试过的地址时返回 False（终态，不无限重搜）", ok_e2 is False)
+
+# 解析器抛异常必须被吞掉，退化为原有终态逻辑
+def boom(t):
+    raise RuntimeError("network down")
+
+
+qe3, statee3 = make_queue()
+task_e3 = seed(statee3, "http://a/1.m3u8", [], failed=["http://a/1.m3u8"])
+qe3._fallback_resolver = boom
+ok_e3 = qe3._requeue_with_fallback(task_e3, "HTTP 403")
+check("解析器异常被吞掉并返回 False（不崩溃、退化为终态）", ok_e3 is False)
+
+# 解析器只在「入队候选用尽」后被调用：仍有入队候选时不应触发（且仍在锁外）
+calls = []
+
+
+def counting_resolver(t):
+    calls.append(1)
+    return ["http://live3/3.m3u8"]
+
+
+qe4, statee4 = make_queue()
+# 仍有入队候选 b -> 直接轮转到 b，跨源解析器根本不应被调用
+task_e4 = seed(statee4, "http://a/1.m3u8", ["http://b/1.m3u8"], failed=["http://a/1.m3u8"])
+qe4._fallback_resolver = counting_resolver
+ok_e4 = qe4._requeue_with_fallback(task_e4, "err")
+row_e4 = statee4["tasks"][0]
+check("仍有入队候选时不触发跨源解析器（仅在用尽后）",
+      ok_e4 and row_e4["url"] == "http://b/1.m3u8" and calls == [], row_e4)
+check("未配置解析器时行为不变（回归）",
+      make_queue()[0]._requeue_with_fallback(
+          seed(make_queue()[1], "http://a/1.m3u8", []), "err") is False)
+
+print()
+print("=" * 72)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
 print("=" * 72)
 sys.exit(1 if FAIL else 0)

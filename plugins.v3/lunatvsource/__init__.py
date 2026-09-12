@@ -938,7 +938,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "https://raw.githubusercontent.com/OneBigMoon/moviepilot-v3-lunatv-source/master/icons/lunatvsource.png"
-    plugin_version = "0.4.86"
+    plugin_version = "0.4.87"
     plugin_author = "OneBigMoon"
     author_url = "https://github.com/OneBigMoon"
     plugin_config_prefix = "lunatvsource_"
@@ -1216,6 +1216,8 @@ class LunaTVSource(_PluginBase):
                     allowed_private_ranges=self._probe_allowed_private_ranges(),
                     ad_filter_regex=self._config["hls_ad_filter_regex"],
                 )
+                # 注入「失败后跨源重新搜索活链」的解析器（下载器在锁外调用）。
+                self._queue.set_fallback_resolver(self._resolve_fallback_sources)
             except Exception:
                 self._queue = None
                 self._release_queue_lock()
@@ -5713,7 +5715,16 @@ class LunaTVSource(_PluginBase):
                         if candidate_url and candidate_url != task.url
                     ]
                     if fallback_urls:
-                        task.alt_urls = fallback_urls[: self._fallback_max_sources()]
+                        # 入队时先用健康探针挑「活链」，避免第一跳就撞上 404/403；
+                        # 若全部探测失败则保留原始候选（运行时仍可跨源解析器兜底）。
+                        live = self._filter_live_urls(fallback_urls)
+                        chosen = (
+                            live[: self._fallback_max_sources()]
+                            if live
+                            else fallback_urls[: self._fallback_max_sources()]
+                        )
+                        if chosen:
+                            task.alt_urls = chosen
                     if identity_source != PLUGIN_MEDIA_SOURCE and identity_id:
                         task.host_media_source = identity_source
                         task.host_media_id = identity_id
@@ -6835,6 +6846,99 @@ class LunaTVSource(_PluginBase):
         except (TypeError, ValueError):
             value = DEFAULT_FALLBACK_MAX_SOURCES
         return max(MIN_FALLBACK_MAX_SOURCES, min(value, MAX_FALLBACK_MAX_SOURCES))
+
+    def _filter_live_urls(self, urls: List[str]) -> List[str]:
+        """探针筛选「活链」：仅保留可用（高度 > 0）的播放地址，去重保序。
+
+        入队时为备选源挑活链用——避免第一跳就撞上 404/403 死链。
+        探针异常时返回空（保守：宁可保留原候选由运行时兜底）。
+        """
+        seen: set[str] = set()
+        uniq: List[str] = []
+        for raw in urls or []:
+            url = str(raw or "").strip()
+            if url and url not in seen:
+                seen.add(url)
+                uniq.append(url)
+        if not uniq:
+            return []
+        try:
+            heights = self._probe_resource_urls(uniq)
+        except Exception:
+            return []
+        return [url for url, height in heights.items() if height > 0]
+
+    def _resolve_fallback_sources(self, task: DownloadTask) -> List[str]:
+        """失败换源时，跨**所有**源重新搜索本集 (season, episode) 的可用播放地址。
+
+        返回经过 ``_probe_resource_urls`` 验证为「活链」（可用）的候选 URL，
+        按质量降序、截断到 ``fallback_max_sources``。调用方会剔除已在
+        ``failed_urls`` / 当前 url 中的地址。
+
+        设计要点：
+        - 仅在 ``source_strategy="first"`` 下有实际意义（``all`` 本身多源并行）。
+        - 网络异常或找不到时返回空列表，**绝不抛异常**——退化为原有终态逻辑。
+        - 不做任何持久化写入，纯查询 + 探针。
+        """
+        if not self._source_fallback_enabled():
+            return []
+        if str(self._config.get("source_strategy") or "first") == "all":
+            return []
+        try:
+            client = self._client()
+            normalized, _ = (self._ai or AiTitleNormalizer(False)).normalize(
+                task.title,
+                str(getattr(task, "year", "") or ""),
+                getattr(task, "media_type", ""),
+            )
+            query = normalized or task.title
+            results = client.search(
+                query,
+                expand_tv_episode_rows=True,
+                max_workers=8,
+            )
+            results = list(
+                self._filter_currently_searchable_results(results, client)
+            )
+            target_season = int(getattr(task, "season", 0) or 0)
+            target_episode = int(getattr(task, "episode", 0) or 0)
+            collected: List[str] = []
+            for raw_result in results:
+                prepared, _association = self._prepare_result(raw_result)
+                rtitle = str(getattr(prepared, "title", "") or "")
+                # 只接受指向同一部剧的结果，避免同名串台。
+                if task.title and task.title not in rtitle and rtitle not in task.title:
+                    continue
+                for ep in getattr(prepared, "episodes", ()) or ():
+                    try:
+                        if int(getattr(ep, "season", 0) or 0) != target_season:
+                            continue
+                        if int(getattr(ep, "episode", 0) or 0) != target_episode:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    url = str(getattr(ep, "url", "") or "").strip()
+                    if url:
+                        collected.append(url)
+            if not collected:
+                return []
+            heights = self._probe_resource_urls(collected)
+            live = sorted(
+                ((h, u) for u, h in heights.items() if h > 0),
+                key=lambda item: -item[0],
+            )
+            if not live:
+                return []
+            return [url for _, url in live[: self._fallback_max_sources()]]
+        except Exception as exc:
+            self._logger.warning(
+                "LunaTV 换源搜索失败 title=%s S%dE%d error=%s",
+                task.title,
+                int(getattr(task, "season", 0) or 0),
+                int(getattr(task, "episode", 0) or 0),
+                exc,
+            )
+            return []
 
     def _collect_episode_candidates(
         self,

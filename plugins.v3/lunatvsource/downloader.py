@@ -2713,11 +2713,17 @@ class DownloadQueue(_SerialDownloadQueue):
         segment_thread_count: int = DEFAULT_SEGMENT_THREAD_COUNT,
         allowed_private_ranges: Iterable[str] = (),
         ad_filter_regex: str = "",
+        fallback_resolver: Optional[Callable[[DownloadTask], List[str]]] = None,
     ) -> None:
         self._load = load
         self._save = save
         self._notify = notify
         self._on_complete = on_complete
+        # 失败时跨源重新搜索 + 健康探针的解析器（由插件侧注入）。
+        # 不在此处调用，避免下载器反向依赖插件搜索子系统。
+        self._fallback_resolver: Optional[Callable[[DownloadTask], List[str]]] = (
+            fallback_resolver
+        )
         self._lock = threading.RLock()
         self._stop = False
         (
@@ -2765,6 +2771,12 @@ class DownloadQueue(_SerialDownloadQueue):
                 *(intent.task for intent in self._pending_terminal.values()),
             ]
         )
+
+    def set_fallback_resolver(
+        self, resolver: Optional[Callable[[DownloadTask], List[str]]]
+    ) -> None:
+        """绑定「失败后跨源重新搜索活链」的解析器（由插件侧实现并注入）。"""
+        self._fallback_resolver = resolver
 
     def _new_n_engine(self, data_path: Path) -> N_m3u8DLEngine:
         try:
@@ -3288,7 +3300,13 @@ class DownloadQueue(_SerialDownloadQueue):
         url -- the caller must then NOT write a terminal state.  The rotation
         is bounded by ``alt_urls`` and each url is attempted at most once
         (``failed_urls``), so it always terminates in a real terminal state.
+
+        When the in-task ``alt_urls`` are exhausted, a configured
+        ``fallback_resolver`` (cross-source re-search + health probe) is
+        consulted for fresh live candidates.  The network call runs WITHOUT
+        the queue lock held so a slow source search never stalls dispatch.
         """
+        resolver = getattr(self, "_fallback_resolver", None)
         with self._lock:
             tasks = self._read()
             current = next(
@@ -3298,8 +3316,44 @@ class DownloadQueue(_SerialDownloadQueue):
                 return False
             failed = _merge_fallback_urls(current.failed_urls, [current.url])
             candidate = _next_fallback_url(current.alt_urls, failed)
-            if not candidate:
+        # 锁外：跨源重新搜索 + 健康探针（网络 I/O，不得持锁）
+        if not candidate and resolver is not None:
+            try:
+                fresh = list(resolver(task))
+            except Exception:
+                LOGGER.exception("LunaTV fallback resolver raised")
+                fresh = []
+            tried = set(_normalize_url_list(failed))
+            norm_current = _normalize_url_list([current.url or ""])
+            if norm_current:
+                tried.add(norm_current[0])
+            fresh = [u for u in _normalize_url_list(fresh) if u and u not in tried]
+            if fresh:
+                with self._lock:
+                    tasks = self._read()
+                    current = next(
+                        (item for item in tasks if item.task_id == task.task_id), None
+                    )
+                    if current is None:
+                        return False
+                    current.alt_urls = _merge_fallback_urls(current.alt_urls, fresh)
+                    failed = _merge_fallback_urls(current.failed_urls, [current.url])
+                    candidate = _next_fallback_url(current.alt_urls, failed)
+                    try:
+                        self._write(tasks)
+                    except Exception:
+                        LOGGER.exception("LunaTV fallback resolver write failed")
+                        return False
+        if not candidate:
+            return False
+        with self._lock:
+            tasks = self._read()
+            current = next(
+                (item for item in tasks if item.task_id == task.task_id), None
+            )
+            if current is None:
                 return False
+            task.alt_urls = list(current.alt_urls)
             current.failed_urls = failed
             current.url = candidate
             current.state = "pending"
@@ -3331,7 +3385,7 @@ class DownloadQueue(_SerialDownloadQueue):
         self._notify(
             "LunaTV 自动换源",
             f"{self._notification_text(task)}：源 {_url_host(failed[-1])} 失败，"
-            f"切换到第 {len(task.failed_urls)} 个备选源 {_url_host(candidate)}{suffix}",
+            f"已跨源搜索并切换到备选源 {_url_host(candidate)}{suffix}",
         )
         return True
 
