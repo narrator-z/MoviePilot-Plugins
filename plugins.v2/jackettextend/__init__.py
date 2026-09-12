@@ -213,7 +213,14 @@ class JackettExtend(_PluginBase):
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_name}/results/torznab/?{query_string}"
 
-            result_array = self.__parse_torznab_xml(api_url)
+            # Jackett 开启 Admin password 后，torznab 接口要求携带登录会话 cookie，
+            # 否则返回 400 "Cookies required" 导致搜索恒为空。此处复用登录获取 cookie。
+            search_headers = {
+                "User-Agent": settings.USER_AGENT,
+                "X-Api-Key": self._api_key,
+            }
+            cookie = self._get_jackett_cookie()
+            result_array = self.__parse_torznab_xml(api_url, cookies=cookie, headers=search_headers)
 
             if not result_array:
                 logger.warning(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 未检索到数据")
@@ -356,7 +363,47 @@ class JackettExtend(_PluginBase):
 
         pass
 
-    def __parse_torznab_xml(self, url) -> List[TorrentInfo]:
+    def _get_jackett_cookie(self):
+        """
+        登录 Jackett 获取会话 cookie（带 5 分钟缓存，避免每次搜索都重新登录）。
+        Jackett 开启 Admin password 后，torznab/torrents 接口必须携带该 cookie 才能鉴权，
+        否则会返回 400 "Cookies required" 导致搜索恒为空。
+        :return: cookie dict 或 None
+        """
+        now = datetime.now()
+        cached = getattr(self, "_jackett_cookie", None)
+        cached_ts = getattr(self, "_jackett_cookie_ts", None)
+        if cached and cached_ts and (now - cached_ts).total_seconds() < 300:
+            return cached
+        if not self._host or not self._password:
+            return None
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": settings.USER_AGENT,
+            "X-Api-Key": self._api_key,
+            "Accept": "application/json, text/javascript, */*; q=0.01"
+        }
+        session = requests.session()
+        try:
+            login_res = RequestUtils(headers=headers, session=session).post_res(
+                url=f"{self._host.rstrip('/')}/UI/Dashboard",
+                data={"password": self._password},
+                params={"password": self._password},
+                proxies=settings.PROXY if self._proxy else None
+            )
+            if login_res and session.cookies:
+                cookie = session.cookies.get_dict()
+                self._jackett_cookie = cookie
+                self._jackett_cookie_ts = datetime.now()
+                return cookie
+            logger.warning(f"【{self.plugin_name}】Jackett 登录失败，无法获取 cookie（搜索将无法鉴权）")
+            return None
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】Jackett 登录异常：{e}")
+            return None
+
+    def __parse_torznab_xml(self, url, cookies: Optional[Dict] = None,
+                            headers: Optional[Dict] = None) -> List[TorrentInfo]:
         """
         从 torznab XML 中解析种子信息
         :param url: XML 数据的 URL
@@ -366,8 +413,10 @@ class JackettExtend(_PluginBase):
             return []
         logger.info(f"【{self.plugin_name}】__parse_torznab_xml 请求: {url}")
         try:
-            ret = RequestUtils(timeout=60).get_res(url,
-                                                   proxies=settings.PROXY if self._proxy else None)
+            ret = RequestUtils(timeout=60,
+                               headers=headers or {},
+                               cookies=cookies).get_res(url,
+                                                       proxies=settings.PROXY if self._proxy else None)
         except Exception as e:
             logger.error(str(e))
             return []
