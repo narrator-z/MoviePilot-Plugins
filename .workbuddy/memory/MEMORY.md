@@ -17,6 +17,9 @@
 9. **「签名收了参数、函数体却不用」是最危险的半截改动** → 用 `.workbuddy/unused_arg_scan.py`（AST）扫。判据：**只有 v2 用了 / v3 没用才算 bug**；v2/v3 成对出现属宿主接口约定（`search_torrents(page/cat)` 等均已确认无害）。
 10. **验证"改了没生效"要直查容器**：`docker exec moviepilot grep -n <新行特征> /app/app/plugins/<id>/<file>`。
 11. **Jackett torznab 只认 query 里的 `apikey`**，cookie/header 一律无效。判定鉴权改动有没有用，唯一判据是**直接发请求对比响应**。
+12. ⚠️ **并行 Edit 会静默覆盖**：同一条消息里对**同一文件**发多个 Edit 时，后写的可能覆盖前一个
+    （本次 `last_progress_at` 字段与 `_update_progress` 改动都被吞，Edit 返回成功、`py_compile` 也过，
+    靠单测才暴露）。**改完必须 grep 确认内容落盘**，别信"编辑成功"返回。
 
 ## 二、仓库与插件市场
 
@@ -69,7 +72,18 @@
   - 入队写 `task.alt_urls`（0.4.87 起先过健康探针挑活链）；失败时 `_requeue_with_fallback` 取下一个未试地址，`progress/attempts` 复位。
   - **有界**：每 url 至多一次（`failed_urls`），耗尽才终态。0.4.87 增加失败用尽后跨所有源重搜 + 探针筛活链（**网络 I/O 必须在 `_lock` 外**；解析器异常吞掉退化为旧终态，绝不无限重搜）。
   - **仅 `source_strategy` 非 `all` 生效**（`all` 本就多源并行）。
-  - 单测 `.workbuddy/luna_fallback_test.py`（36 用例，全过）。
+  - 单测 `.workbuddy/luna_fallback_test.py`（65 用例，全过）。
+- **0.4.88 无进展看门狗**（换源原先**只覆盖「失败」**，覆盖不到「卡在下载中不动」）：
+  - `DownloadTask.last_progress_at` 记最后一次进度推进时刻；`_update_progress` 在
+    `value > progress or value >= 0.99` 时刷新（**N_m3u8DL-RE 把投影钳在 0.99**，封顶仍算存活 → 慢下载不误判）。
+  - `_reap_stalled_tasks()` 只发中止信号（`control.action="stall"` + `event.set()`），
+    **状态迁移交给拥有该任务的 worker**（避免持久化与内存 claim 分叉）；30s 扫描节流。
+  - `_run_claimed` stall 分支 → `_finish_stalled` 复用 `_requeue_with_fallback`（有界不变式不变）。
+  - **驱动点**：派发循环只在有待处理任务时才跑，队列里唯一的任务卡住不会自检查 →
+    必须由定时服务 `run_queue()`（每 `queue_minutes`=1 分钟）驱动。
+  - 配置 `stall_timeout_minutes` 默认 15（0–240，0=关闭）；老任务首扫**只回填不中止**（升级不误杀）。
+  - 实证：任务队列在 `plugindata` 的 **`download_tasks_v1`**（非文件名含 luna）；LunaTVSource 是
+    **镜像内置插件**，源码在 `/app/app/plugins/lunatvsource/`（`/config/plugins/LunaTVSource/` 只有数据）。
 - 源列表在 `plugindata.luna_source_config_v1`（值是列表）；CMS：搜索 `?ac=list&wd=&pg=`、详情 `?ac=detail&ids=`；`vod_play_url` 用 `$$$` 分线路、`#` 分集、`$` 分名称/URL。
 
 ## 六、下载守卫 StuckDownloadGuard（1.1.1 起）
