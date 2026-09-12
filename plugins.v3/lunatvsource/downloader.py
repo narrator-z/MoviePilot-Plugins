@@ -116,13 +116,18 @@ def normalize_download_concurrency(
     return max_tasks, segment_threads
 
 
+# Minimum gap between two stall-watchdog sweeps, in seconds.  Dispatch can
+# call the watchdog in a tight loop and every sweep re-reads the persisted
+# queue, so the sweep is throttled independently of the stall timeout.
+_STALL_SWEEP_INTERVAL = 30.0
+
+
 class _QueueControl(RuntimeError):
     """Internal signal used to stop the active download process safely."""
 
     def __init__(self, action: str) -> None:
         super().__init__(action)
         self.action = action
-
 
 class _HLSPrepareLimitError(RuntimeError):
     """A global playlist preparation budget was exhausted."""
@@ -297,6 +302,12 @@ class DownloadTask:
     # MoviePilot's native download projection uses a 0..1 value.  Older
     # persisted tasks do not have this field and are restored with 0.0.
     progress: float = 0.0
+    # Wall-clock timestamp of the last observed progress advance.  Drives the
+    # stall watchdog: a running task whose progress stops moving for longer
+    # than the configured timeout is aborted and rotated to the next source.
+    # Restored as 0.0 for tasks persisted before the watchdog existed, which
+    # the watchdog treats as "unknown" and backfills on the first sweep.
+    last_progress_at: float = 0.0
     # Empty keeps persisted tasks created before engine attribution compatible.
     download_engine: str = ""
     # Persist before MoviePilot moves the completed file so season totals stay
@@ -464,7 +475,7 @@ def _download_task_from_payload(value: object) -> DownloadTask:
     if any(
         isinstance(getattr(task, name), bool)
         or not isinstance(getattr(task, name), (int, float))
-        for name in ("created_at", "completed_at", "progress")
+        for name in ("created_at", "completed_at", "progress", "last_progress_at")
     ):
         raise ValueError("task record contains an invalid number")
     if type(task.delete_file) is not bool:
@@ -1144,6 +1155,7 @@ class _SerialDownloadQueue:
                 return {"processed": 0}
             task.state = "running"
             task.progress = max(0.0, min(1.0, float(task.progress or 0.0)))
+            task.last_progress_at = time.time()
             task.control_action = ""
             task.delete_file = False
             task.attempts += 1
@@ -1810,6 +1822,12 @@ class _SerialDownloadQueue:
             task = next((item for item in tasks if item.task_id == task_id), None)
             if task is None or task.state != "running":
                 return
+            # Refresh the stall watchdog clock whenever the engine shows
+            # forward movement.  The engine caps its own projection at 0.99
+            # well before the file is finished, so a saturated value still
+            # counts as alive -- only a silent engine is treated as stalled.
+            if value > task.progress or value >= 0.99:
+                task.last_progress_at = time.time()
             task.progress = value
             self._write(tasks)
 
@@ -2714,6 +2732,7 @@ class DownloadQueue(_SerialDownloadQueue):
         allowed_private_ranges: Iterable[str] = (),
         ad_filter_regex: str = "",
         fallback_resolver: Optional[Callable[[DownloadTask], List[str]]] = None,
+        stall_timeout_minutes: float = 15.0,
     ) -> None:
         self._load = load
         self._save = save
@@ -2724,6 +2743,10 @@ class DownloadQueue(_SerialDownloadQueue):
         self._fallback_resolver: Optional[Callable[[DownloadTask], List[str]]] = (
             fallback_resolver
         )
+        # 无进展看门狗：running 任务进度静止超过该分钟数即中止并换源。
+        # 0/负数表示关闭（退回旧行为：只有真正失败才换源）。
+        self._stall_timeout_minutes = stall_timeout_minutes
+        self._last_stall_sweep = 0.0
         self._lock = threading.RLock()
         self._stop = False
         (
@@ -2959,6 +2982,7 @@ class DownloadQueue(_SerialDownloadQueue):
                 return None
             task.state = "running"
             task.progress = max(0.0, min(1.0, float(task.progress or 0.0)))
+            task.last_progress_at = time.time()
             task.attempts += 1
             task.download_engine = "N_m3u8DL-RE"
             control = _TaskControl()
@@ -3099,6 +3123,8 @@ class DownloadQueue(_SerialDownloadQueue):
             output = self._execute(task)
         except _QueueControl as exc:
             action = control.action or exc.action
+            if action == "stall":
+                return self._finish_stalled(task, control)
             if action not in {"pause", "remove"}:
                 action = "pause"
             return self._finish_controlled(task, control, action)
@@ -3388,6 +3414,125 @@ class DownloadQueue(_SerialDownloadQueue):
             f"已跨源搜索并切换到备选源 {_url_host(candidate)}{suffix}",
         )
         return True
+
+    def _stall_timeout_seconds(self) -> float:
+        """Configured no-progress window before a running task is rotated."""
+
+        raw = getattr(self, "_stall_timeout_minutes", 0)
+        try:
+            minutes = float(raw or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return minutes * 60.0 if minutes > 0 else 0.0
+
+    def _reap_stalled_tasks(self) -> int:
+        """Abort running tasks whose progress stopped moving.
+
+        A hung download never fails on its own: the engine holds the task in
+        ``running`` forever, so the failure-driven fallback rotation never
+        fires.  That is exactly the "下载中一直不动" case -- the task is
+        neither completed nor failed and therefore invisible to the rotation.
+        This watchdog turns silence into the same rotation path a real failure
+        takes, so a mid-download hang (sitting at e.g. 40% with no throughput)
+        becomes recoverable instead of blocking the queue slot forever.
+
+        Only the cancellation signal is raised here.  The owning worker owns
+        the state transition, so the persisted record and the in-memory claim
+        can never diverge.
+        """
+
+        timeout = self._stall_timeout_seconds()
+        if timeout <= 0:
+            return 0
+        now = time.time()
+        # Dispatch can call this in a tight loop and every sweep re-reads the
+        # persisted queue, so throttle the sweep itself.
+        if now - getattr(self, "_last_stall_sweep", 0.0) < _STALL_SWEEP_INTERVAL:
+            return 0
+        self._last_stall_sweep = now
+        with self._lock:
+            controls = list(self._active.items())
+            tasks = self._read()
+        by_id = {item.task_id: item for item in tasks}
+        reaped = 0
+        for task_id, control in controls:
+            if control.action:
+                continue
+            task = by_id.get(task_id)
+            if task is None or task.state != "running":
+                continue
+            # Tasks persisted before the watchdog existed carry no clock.
+            # Backfill once instead of reaping them on the very first sweep.
+            if not task.last_progress_at:
+                with self._lock:
+                    fresh = self._read()
+                    current = next(
+                        (item for item in fresh if item.task_id == task_id), None
+                    )
+                    if current is not None and not current.last_progress_at:
+                        current.last_progress_at = now
+                        try:
+                            self._write(fresh)
+                        except Exception:
+                            LOGGER.exception("LunaTV stall backfill write failed")
+                continue
+            if now - task.last_progress_at < timeout:
+                continue
+            LOGGER.warning(
+                "LunaTV 下载无进展 %.1f 分钟，判定卡住并换源: task_id=%s title=%s S%sE%s",
+                (now - task.last_progress_at) / 60.0,
+                task_id,
+                task.title,
+                task.season,
+                task.episode,
+            )
+            control.action = "stall"
+            control.event.set()
+            reaped += 1
+        return reaped
+
+    def reap_stalled_tasks(self) -> int:
+        """Public sweep entry used by the plugin's periodic scheduler.
+
+        The dispatch loop only runs while there is pending work, so a queue
+        whose single task is hanging would never self-check.  The scheduler
+        drives the watchdog instead, which keeps the sweep alive while any
+        task is still running.
+        """
+
+        return self._reap_stalled_tasks()
+
+    def _finish_stalled(
+        self, task: DownloadTask, control: _TaskControl
+    ) -> Dict[str, Any]:
+        """Rotate a task whose download stopped making progress.
+
+        Retrying the same stalled url is pointless, so this goes straight to
+        the bounded fallback rotation: next untried alternate, then the
+        cross-source resolver, then a real terminal ``failed`` state.
+        """
+
+        error = f"下载无进展超过 {int(self._stall_timeout_seconds() // 60)} 分钟"
+        if self._requeue_with_fallback(task, error):
+            return {
+                "processed": 1,
+                "task_id": task.task_id,
+                "state": "pending",
+                "fallback": True,
+                "stalled": True,
+            }
+        with self._lock:
+            try:
+                self._persist_terminal_intent(
+                    _TerminalIntent(
+                        task=task, control=control, state="failed", error=error
+                    )
+                )
+            except Exception:
+                self._defer_terminal(task, control, "failed", error=error)
+            else:
+                self._release(task.task_id)
+        return {"processed": 1, "task_id": task.task_id, "state": "failed"}
 
     def _finish_failed(
         self, task: DownloadTask, control: _TaskControl, exc: Exception

@@ -201,6 +201,12 @@ SOURCE_HEALTH_WORKERS = 8
 DEFAULT_FALLBACK_MAX_SOURCES = 2
 MIN_FALLBACK_MAX_SOURCES = 0
 MAX_FALLBACK_MAX_SOURCES = 5
+# 无进展看门狗：running 任务的进度静止超过该分钟数即判定卡住，
+# 中止当前下载并走换源轮转（否则下载会永远挂在「下载中」不动）。
+# 0 表示关闭看门狗，退回「只有真正失败才换源」的旧行为。
+DEFAULT_STALL_TIMEOUT_MINUTES = 15
+MIN_STALL_TIMEOUT_MINUTES = 0
+MAX_STALL_TIMEOUT_MINUTES = 240
 DEFAULT_SOURCE_ALLOWLIST = (
     "suonizy.net,suoniapi.com,kuaichezy.com,caiji.kuaichezy.org,"
     "www.hongniuzy.com,www.hongniuzy2.com,wujinzy.net,wujinzy.me,"
@@ -938,7 +944,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "https://raw.githubusercontent.com/OneBigMoon/moviepilot-v3-lunatv-source/master/icons/lunatvsource.png"
-    plugin_version = "0.4.87"
+    plugin_version = "0.4.88"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "lunatvsource_"
@@ -1215,6 +1221,7 @@ class LunaTVSource(_PluginBase):
                     segment_thread_count=self._config["segment_thread_count"],
                     allowed_private_ranges=self._probe_allowed_private_ranges(),
                     ad_filter_regex=self._config["hls_ad_filter_regex"],
+                    stall_timeout_minutes=self._stall_timeout_minutes(),
                 )
                 # 注入「失败后跨源重新搜索活链」的解析器（下载器在锁外调用）。
                 self._queue.set_fallback_resolver(self._resolve_fallback_sources)
@@ -1457,6 +1464,24 @@ class LunaTVSource(_PluginBase):
                     {
                         "component": "VTextField",
                         "props": {
+                            "model": "stall_timeout_minutes",
+                            "label": "无进展多久判定卡住（分钟）",
+                            "type": "number",
+                            "min": MIN_STALL_TIMEOUT_MINUTES,
+                            "max": MAX_STALL_TIMEOUT_MINUTES,
+                            "step": 1,
+                            "hint": (
+                                f"下载中但进度长时间不动（既未完成也未报错）超过该时长，"
+                                f"即中止并自动换源；范围 {MIN_STALL_TIMEOUT_MINUTES}–"
+                                f"{MAX_STALL_TIMEOUT_MINUTES}，默认 "
+                                f"{DEFAULT_STALL_TIMEOUT_MINUTES}；0 表示关闭（只有真正失败才换源）。"
+                            ),
+                            "persistentHint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
                             "model": "download_root",
                             "label": "下载目录（可留空，自动复用 MoviePilot）",
                             "placeholder": "/media/incoming/lunatv",
@@ -1589,6 +1614,7 @@ class LunaTVSource(_PluginBase):
             "source_strategy": "first",
             "source_fallback": True,
             "fallback_max_sources": DEFAULT_FALLBACK_MAX_SOURCES,
+            "stall_timeout_minutes": DEFAULT_STALL_TIMEOUT_MINUTES,
             "download_root": "",
             "use_moviepilot_dirs": True,
             "ffmpeg_path": "ffmpeg",
@@ -1739,6 +1765,7 @@ class LunaTVSource(_PluginBase):
             "source_strategy": "first",
             "source_fallback": True,
             "fallback_max_sources": DEFAULT_FALLBACK_MAX_SOURCES,
+            "stall_timeout_minutes": DEFAULT_STALL_TIMEOUT_MINUTES,
             "download_root": "",
             "use_moviepilot_dirs": True,
             "mode": "download",
@@ -5831,6 +5858,13 @@ class LunaTVSource(_PluginBase):
     def run_queue(self) -> Dict[str, Any]:
         if not self._queue:
             return {"processed": 0}
+        # 无进展看门狗：把「下载中一直不动」的任务转成换源轮转。
+        # 派发循环只在有待处理任务时才跑，队列里唯一的任务卡住时不会自检查，
+        # 因此必须由定时扫描驱动，卡住的下载才能被中止并换源。
+        try:
+            self._queue.reap_stalled_tasks()
+        except Exception as exc:  # pragma: no cover - 看门狗不得影响派发
+            self._logger.warning("LunaTV 无进展看门狗扫描失败: %s", exc)
         return {"processed": 0, "scheduled": self._queue.wake()}
 
     def _start_queue(self) -> bool:
@@ -6846,6 +6880,23 @@ class LunaTVSource(_PluginBase):
         except (TypeError, ValueError):
             value = DEFAULT_FALLBACK_MAX_SOURCES
         return max(MIN_FALLBACK_MAX_SOURCES, min(value, MAX_FALLBACK_MAX_SOURCES))
+
+    def _stall_timeout_minutes(self) -> float:
+        """进度静止多久判定为卡住（0 = 关闭看门狗）。
+
+        看门狗只影响「下载中一直不动」的任务；真正失败的换源由
+        ``source_fallback`` 独立控制，两者互不干扰。
+        """
+        try:
+            value = float(self._config.get("stall_timeout_minutes"))
+        except (TypeError, ValueError):
+            value = DEFAULT_STALL_TIMEOUT_MINUTES
+        if value != value:  # NaN
+            value = DEFAULT_STALL_TIMEOUT_MINUTES
+        return max(
+            float(MIN_STALL_TIMEOUT_MINUTES),
+            min(value, float(MAX_STALL_TIMEOUT_MINUTES)),
+        )
 
     def _filter_live_urls(self, urls: List[str]) -> List[str]:
         """探针筛选「活链」：仅保留可用（高度 > 0）的播放地址，去重保序。

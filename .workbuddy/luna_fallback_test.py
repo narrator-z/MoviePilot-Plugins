@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 
 PKG = "luna_src"
@@ -270,6 +271,126 @@ check("仍有入队候选时不触发跨源解析器（仅在用尽后）",
 check("未配置解析器时行为不变（回归）",
       make_queue()[0]._requeue_with_fallback(
           seed(make_queue()[1], "http://a/1.m3u8", []), "err") is False)
+
+print()
+print("=" * 72)
+print("F. 无进展看门狗（下载中一直不动 → 中止并换源）")
+print("=" * 72)
+
+
+def make_watchdog(timeout_minutes=15.0, alts=("http://b/1.m3u8",),
+                  seconds_idle=None, tid="tw", legacy_clock=False):
+    """构造一个 running 任务 + 其 _TaskControl，模拟正在下载的状态。"""
+    q, state = make_queue()
+    q._stall_timeout_minutes = timeout_minutes
+    q._last_stall_sweep = 0.0
+    q._fallback_resolver = None
+    q._pending_terminal = {}
+    task = dl.DownloadTask(task_id=tid, source_key="lunatv", media_id="tmdb:1",
+                           title="卡住的剧", year="2026", media_type="tv",
+                           season=2, episode=3, url="http://a/1.m3u8", root="/tmp")
+    task.state = "running"
+    task.progress = 0.4
+    task.alt_urls = list(alts)
+    if not legacy_clock:
+        # 进度最后一次推进是在 seconds_idle 之前
+        task.last_progress_at = time.time() - (
+            seconds_idle if seconds_idle is not None else (timeout_minutes * 60 + 60)
+        )
+    state["tasks"] = [task.to_dict()]
+    control = dl._TaskControl()
+    q._active[tid] = control
+    return q, state, control
+
+
+# F1 超时未推进 → 中止并请求换源
+qf, sf, cf = make_watchdog(timeout_minutes=10, seconds_idle=15 * 60)
+reaped = qf.reap_stalled_tasks()
+check("进度静止超阈值 → 判定卡住（返回 1）", reaped == 1, reaped)
+check("卡住任务被置 stall 中止信号", cf.action == "stall", cf.action)
+check("中止信号已通知执行线程（event 已置位）", cf.event.is_set())
+
+# F2 仍在推进 → 不中止
+qf2, _sf2, cf2 = make_watchdog(timeout_minutes=10, seconds_idle=60)
+check("未超阈值不中止（返回 0）", qf2.reap_stalled_tasks() == 0)
+check("未超阈值时 action 保持为空", cf2.action == "", cf2.action)
+
+# F3 关闭看门狗（0 分钟）→ 退回旧行为
+qf3, _sf3, cf3 = make_watchdog(timeout_minutes=0, seconds_idle=99999)
+check("stall_timeout=0 关闭看门狗（返回 0）", qf3.reap_stalled_tasks() == 0)
+check("关闭时不做任何中止", cf3.action == "", cf3.action)
+
+# F4 老任务无时钟 → 首次扫描只回填，不误杀
+qf4, sf4, cf4 = make_watchdog(legacy_clock=True, tid="tlegacy")
+check("老任务（无时钟）首次扫描不中止", qf4.reap_stalled_tasks() == 0)
+check("老任务时钟被回填", sf4["tasks"][0]["last_progress_at"] > 0,
+      sf4["tasks"][0].get("last_progress_at"))
+check("老任务回填后 action 仍为空", cf4.action == "", cf4.action)
+# 回填后再等一个超时周期才真正中止（复位扫描时钟以绕过节流）
+qf4._last_stall_sweep = 0.0
+sf4["tasks"][0]["last_progress_at"] = time.time() - 20 * 60
+check("回填后再次静止才中止（返回 1）", qf4.reap_stalled_tasks() == 1)
+check("回填后中止信号为 stall", cf4.action == "stall", cf4.action)
+
+# F5 已有中止意图的任务不重复处理
+qf5, _sf5, cf5 = make_watchdog(timeout_minutes=10, seconds_idle=99999)
+cf5.action = "pause"
+check("已有中止意图时跳过（返回 0）", qf5.reap_stalled_tasks() == 0)
+check("已有中止意图不被覆盖为 stall", cf5.action == "pause", cf5.action)
+
+# F6 非 running 状态不中止（不误伤 pending/paused）
+qf6, sf6, cf6 = make_watchdog(timeout_minutes=10, seconds_idle=99999)
+sf6["tasks"][0]["state"] = "pending"
+check("非 running 任务不被看门狗中止", qf6.reap_stalled_tasks() == 0)
+check("非 running 任务 action 保持为空", cf6.action == "", cf6.action)
+
+# F7 引擎持续推进进度 → 刷新时钟，不判卡住
+qf7, sf7, cf7 = make_watchdog(timeout_minutes=10, seconds_idle=99999)
+qf7._update_progress("tw", 0.55)  # 有推进
+check("进度推进后时钟被刷新",
+      sf7["tasks"][0]["last_progress_at"] > time.time() - 30,
+      sf7["tasks"][0].get("last_progress_at"))
+check("持续推进的任务不被中止", qf7.reap_stalled_tasks() == 0)
+
+# F8 进度封顶 0.99 仍视为存活（N_m3u8DL-RE 会把投影钳到 0.99）
+qf8, sf8, cf8 = make_watchdog(timeout_minutes=10, seconds_idle=99999, tid="tsat")
+qf8._update_progress("tsat", 0.99)
+check("进度封顶 0.99 仍刷新时钟（下载未结束时不算卡住）",
+      sf8["tasks"][0]["last_progress_at"] > time.time() - 30,
+      sf8["tasks"][0].get("last_progress_at"))
+check("封顶任务不被误判卡住", qf8.reap_stalled_tasks() == 0)
+
+# F9 扫描节流：同一窗口内重复调用不再读队列
+qf9, _sf9, cf9 = make_watchdog(timeout_minutes=10, seconds_idle=99999, tid="tthr")
+first = qf9.reap_stalled_tasks()
+check("首次扫描生效", first == 1, first)
+cf9.action = ""  # 手动复位以观察节流（正常流程由 worker 消费）
+check("节流窗口内二次扫描被跳过（返回 0）", qf9.reap_stalled_tasks() == 0)
+
+# F10 _finish_stalled 有候选 → 回到 pending 并换 url（走有界轮转）
+qf10, sf10, cf10 = make_watchdog(timeout_minutes=10, seconds_idle=99999,
+                                 alts=("http://b/1.m3u8", "http://c/1.m3u8"),
+                                 tid="tsw")
+qf10.reap_stalled_tasks()
+task_f10 = qf10._read()[0]
+result = qf10._finish_stalled(task_f10, cf10)
+row_f10 = next(x for x in sf10["tasks"] if x["task_id"] == "tsw")
+check("卡住换源后回到 pending", result["state"] == "pending", result)
+check("卡住换源切到备选地址", row_f10["url"] == "http://b/1.m3u8", row_f10["url"])
+check("卡住的当前地址计入 failed_urls（每源至多一次）",
+      "http://a/1.m3u8" in row_f10["failed_urls"], row_f10["failed_urls"])
+check("换源结果标记 stalled", result.get("stalled") is True, result)
+check("换源后进度复位", row_f10["progress"] == 0.0, row_f10["progress"])
+
+# F11 无候选可换 → 有界终态 failed（绝不无限重搜）
+qf11, sf11, cf11 = make_watchdog(timeout_minutes=10, seconds_idle=99999,
+                                 alts=(), tid="tnone")
+qf11.reap_stalled_tasks()
+task_f11 = qf11._read()[0]
+qf11._persist_terminal_intent = lambda intent: None  # 桩掉落盘，只验证不换源
+res11 = qf11._requeue_with_fallback(task_f11, "下载无进展超过 10 分钟")
+check("卡住且无候选时换源返回 False（有界，终态 failed）", res11 is False, res11)
+check("无候选时不产生新 url", task_f11.url == "http://a/1.m3u8", task_f11.url)
 
 print()
 print("=" * 72)
