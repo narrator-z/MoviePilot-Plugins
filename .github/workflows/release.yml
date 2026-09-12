@@ -10,6 +10,8 @@ on:
       - "package.json"
       - "package.v2.json"
       - "package.v3.json"
+      - ".github/workflows/release.yml"
+      - ".github/scripts/**"
   workflow_dispatch:
 
 permissions:

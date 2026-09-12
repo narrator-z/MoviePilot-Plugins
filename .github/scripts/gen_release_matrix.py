@@ -37,6 +37,7 @@ def changed_since_last_tag(dirpath: str) -> bool:
 
 def main() -> None:
     matrix = []
+    seen = set()  # 同一插件可能同时出现在 base 与 v2/v3 索引中，只打包一次
     for idx, candidates in INDEX_MAP:
         path = os.path.join(ROOT, idx)
         if not os.path.isfile(path):
@@ -45,6 +46,8 @@ def main() -> None:
             data = json.load(f)
         for pid, entry in data.items():
             if not (isinstance(entry, dict) and entry.get("release")):
+                continue
+            if pid in seen:
                 continue
             dirpath = None
             for cand in candidates:
@@ -56,8 +59,15 @@ def main() -> None:
                 continue
             if not changed_since_last_tag(dirpath):
                 continue
+            seen.add(pid)
             matrix.append({"id": pid, "version": entry.get("version", ""), "dir": dirpath})
-    print(f"matrix={json.dumps(matrix)}")
+    payload = json.dumps(matrix)
+    print(f"matrix={payload}")
+    # 供 workflow 使用：outputs.matrix = ${{ steps.gen.outputs.matrix }}
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(f"matrix={payload}\n")
 
 
 if __name__ == "__main__":
