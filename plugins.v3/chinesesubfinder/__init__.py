@@ -30,14 +30,14 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.config import settings
-from app.core.context import MediaInfo
-from app.core.event import eventmanager, Event
+from app.sdk.config import settings
+from app.sdk.media import MediaInfo
+from app.sdk.events import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import Notification, TransferInfo
 from app.schemas.types import EventType, MediaType, NotificationType
-from app.utils.http import RequestUtils
+from app.sdk.network import RequestUtils
 
 # /api/v1 外部接口路径（与 ChineseSubFinder 源码 router.Group("/api/v1") 一致）
 _API_ADD_JOB = "api/v1/add-job"
@@ -54,7 +54,7 @@ class ChineseSubFinder(_PluginBase):
     # 插件图标
     plugin_icon = "chinesesubfinder.png"
     # 插件版本
-    plugin_version = "6.0.2"
+    plugin_version = "6.0.3"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页

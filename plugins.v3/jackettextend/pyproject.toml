@@ -1,0 +1,8 @@
+[project]
+name = "moviepilot-plugin-jackettextend"
+dynamic = ["version"]
+dependencies = [
+    "requests",
+    "pytz",
+    "APScheduler",
+]

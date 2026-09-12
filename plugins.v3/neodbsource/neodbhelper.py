@@ -20,9 +20,9 @@ themoviedb.org URL 中，因此需要解析提取。
 import re
 from typing import Dict, List, Optional
 
-from app.core.context import MediaInfo
+from app.sdk.media import MediaInfo
 from app.schemas.types import MediaType
-from app.utils.http import AsyncRequestUtils, RequestUtils
+from app.sdk.network import AsyncRequestUtils, RequestUtils
 
 # NeoDB 类别 -> MoviePilot 媒体类型
 _CATEGORY_TO_MTYPE = {

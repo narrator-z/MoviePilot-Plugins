@@ -1,0 +1,4 @@
+pytz
+APScheduler
+qbittorrent-api
+transmission-rpc

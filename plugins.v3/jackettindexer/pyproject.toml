@@ -1,0 +1,6 @@
+[project]
+name = "moviepilot-plugin-jackettindexer"
+dynamic = ["version"]
+dependencies = [
+    "APScheduler",
+]

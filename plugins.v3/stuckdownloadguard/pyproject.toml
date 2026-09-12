@@ -1,0 +1,9 @@
+[project]
+name = "moviepilot-plugin-stuckdownloadguard"
+dynamic = ["version"]
+dependencies = [
+    "pytz",
+    "APScheduler",
+    "qbittorrent-api",
+    "transmission-rpc",
+]

@@ -8,15 +8,15 @@ from urllib.parse import urlencode, quote_plus
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from app.helper.sites import SitesHelper
+from app.sdk.network import SitesHelper
 
-from app.core.context import TorrentInfo
+from app.sdk.media import TorrentInfo
 from app.plugins import _PluginBase
-from app.core.config import settings
+from app.sdk.config import settings
 from app.schemas import MediaType
-from app.utils.http import RequestUtils
+from app.sdk.network import RequestUtils
 from app.log import logger
-from app.utils.string import StringUtils
+from app.sdk.utilities import StringUtils
 
 
 class ProwlarrExtend(_PluginBase):
@@ -27,7 +27,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "6.0.0"
+    plugin_version = "6.0.1"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页

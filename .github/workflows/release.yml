@@ -1,0 +1,71 @@
+name: Release Plugins
+
+# Repository_Guide §8：任一 package*.json 变更触发；仅 release:true 的插件参与打包；
+# Tag = 插件ID_v版本号；zip = 目录小写_v版本号.zip；无变化跳过；同名 Release 先删再建。
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "package.json"
+      - "package.v2.json"
+      - "package.v3.json"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  versions:
+    name: Version gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check index/code version consistency
+        run: python3 .github/scripts/check_plugin_versions.py
+
+  prepare:
+    name: Build release matrix
+    runs-on: ubuntu-latest
+    needs: versions
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: gen
+        run: python3 .github/scripts/gen_release_matrix.py
+
+  release:
+    name: Pack & publish
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '[]'
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pack plugin
+        env:
+          DIR: ${{ matrix.dir }}
+          VER: ${{ matrix.version }}
+        run: |
+          BASE="$(basename "$DIR")"
+          ZIP="${BASE,,}_v${VER}.zip"
+          (cd "$(dirname "$DIR")" && zip -qr "${GITHUB_WORKSPACE}/${ZIP}" "$BASE")
+          echo "ZIP=${ZIP}" >> "$GITHUB_ENV"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PID: ${{ matrix.id }}
+          VER: ${{ matrix.version }}
+        run: |
+          TAG="${PID}_v${VER}"
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" "$ZIP" \
+            --title "$PID v$VER" \
+            --notes "自动发布：$PID v$VER（插件目录 $DIR）"

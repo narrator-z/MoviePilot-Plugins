@@ -40,12 +40,13 @@ try:
     from app.chain.search import SearchChain
 except ImportError:
     SearchChain = None
-from app.db.downloadhistory_oper import DownloadHistoryOper
-from app.db.systemconfig_oper import SystemConfigOper
+from app.db.oper.downloadhistory import DownloadHistoryOper
+from app.db.oper.systemconfig import SystemConfigOper
+# ThreadHelper 暂无 app.sdk 稳定出口（app.sdk.services 无此符号），保留已登记兼容路径
 from app.helper.thread import ThreadHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.core.config import settings
+from app.sdk.config import settings
 from app.schemas.types import NotificationType, SystemConfigKey
 try:
     from app.schemas.types import MediaType
@@ -81,7 +82,7 @@ class StuckDownloadGuard(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页

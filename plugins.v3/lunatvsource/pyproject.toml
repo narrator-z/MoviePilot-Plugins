@@ -1,0 +1,6 @@
+[project]
+name = "moviepilot-plugin-lunatvsource"
+dynamic = ["version"]
+dependencies = [
+    "APScheduler",
+]

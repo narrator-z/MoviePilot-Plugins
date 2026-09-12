@@ -18,10 +18,10 @@ NeoDB 公开 API 无需鉴权即可搜索/查看目录与热门榜单；如需�
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.config import settings
-from app.core.context import MediaInfo
-from app.core.event import Event, eventmanager
-from app.core.meta import MetaBase
+from app.sdk.config import settings
+from app.sdk.media import MediaInfo
+from app.sdk.events import Event, eventmanager
+from app.sdk.media import MetaBase
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import (
@@ -32,7 +32,7 @@ from app.schemas import (
     RecommendSourceEventData,
 )
 from app.schemas.types import ChainEventType, EventType, MediaType
-from app.utils.http import AsyncRequestUtils, RequestUtils
+from app.sdk.network import AsyncRequestUtils, RequestUtils
 
 from .neodbhelper import NeoDBHelper
 
@@ -45,7 +45,7 @@ class NeoDBSource(_PluginBase):
     # 插件图标
     plugin_icon = "neodb.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页

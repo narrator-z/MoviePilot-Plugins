@@ -96,12 +96,7 @@ except Exception:
 try:  # pragma: no cover - exercised in a MoviePilot runtime
     from app.sdk.services import MediaServerHelper as _HostMediaServerHelper
 except Exception:
-    try:  # pragma: no cover - compatibility with early V3 runtimes
-        from app.application.mediaserver import (
-            MediaServerHelper as _HostMediaServerHelper,
-        )
-    except Exception:
-        _HostMediaServerHelper = None
+    _HostMediaServerHelper = None
 
 try:  # pragma: no cover - exercised in a MoviePilot runtime
     from app.chain.subscribe import SubscribeChain as _HostSubscribeChain
@@ -161,6 +156,8 @@ from .naming import (
     normalize_search_title,
 )
 
+# 注意：DirectoryHelper / build_media_download_path 暂无 app.sdk 稳定出口，
+# 保留宿主已登记的兼容路径（app.application.directory），失败时自动置 None 走内置兜底。
 try:  # Optional host services used for directory and TMDB association hints.
     from app.application.directory import DirectoryHelper as _HostDirectoryHelper
     from app.chain.media import MediaChain as _HostMediaChain
@@ -943,8 +940,8 @@ class LunaTVSource(_PluginBase):
 
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
-    plugin_icon = "https://raw.githubusercontent.com/OneBigMoon/moviepilot-v3-lunatv-source/master/icons/lunatvsource.png"
-    plugin_version = "0.4.88"
+    plugin_icon = "lunatvsource.png"
+    plugin_version = "0.4.89"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "lunatvsource_"

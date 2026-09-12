@@ -1,0 +1,7 @@
+[project]
+name = "moviepilot-plugin-prowlarrextend"
+dynamic = ["version"]
+dependencies = [
+    "pytz",
+    "APScheduler",
+]

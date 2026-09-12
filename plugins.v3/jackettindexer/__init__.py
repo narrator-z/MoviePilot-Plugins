@@ -23,15 +23,14 @@ from typing import Type
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.context import TorrentInfo
-from app.core.event import eventmanager, Event
-from app.helper.sites import SitesHelper
+from app.sdk.media import TorrentInfo
+from app.sdk.events import eventmanager, Event
+from app.sdk.network import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType, EventType
-from app.utils.dom import DomUtils
-from app.utils.http import RequestUtils
-from app.utils.string import StringUtils
+from app.sdk.utilities import DomUtils, StringUtils
+from app.sdk.network import RequestUtils
 
 from .agenttool import SearchTorrentsTool, ListIndexersTool
 
@@ -48,7 +47,7 @@ class JackettIndexer(_PluginBase):
     plugin_name = "Jackett索引器"
     plugin_desc = "集成Jackett索引器搜索，支持Torznab协议多站点搜索。仅索引私有和半公开站点。"
     plugin_icon = "Jackett_A.png"
-    plugin_version = "6.1.0"
+    plugin_version = "6.1.1"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "jackettindexer_"
@@ -670,7 +669,7 @@ class JackettIndexer(_PluginBase):
         遵循与 __search_all_sites 相同的站点启用过滤逻辑。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from app.db.systemconfig_oper import SystemConfigOper
+        from app.db.oper.systemconfig import SystemConfigOper
         from app.schemas.types import SystemConfigKey
 
         enabled_ids = sites or SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
@@ -707,7 +706,7 @@ class JackettIndexer(_PluginBase):
         异步：对本插件自己的索引器用英文标题发起补充搜索。
         """
         import asyncio
-        from app.db.systemconfig_oper import SystemConfigOper
+        from app.db.oper.systemconfig import SystemConfigOper
         from app.schemas.types import SystemConfigKey
 
         enabled_ids = sites or SystemConfigOper().get(SystemConfigKey.IndexerSites) or []
