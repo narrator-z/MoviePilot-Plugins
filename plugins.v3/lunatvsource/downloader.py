@@ -396,6 +396,9 @@ def _normalize_url_list(value: object) -> List[str]:
     seen: set[str] = set()
     result: List[str] = []
     for item in value:
+        if isinstance(item, dict):
+            # 旧版本曾把结构化候选对象（含 url 键）写进 alt_urls。
+            item = item.get("url")
         url = str(item or "").strip()
         if not url or url in seen:
             continue
@@ -484,10 +487,20 @@ def _download_task_from_payload(value: object) -> DownloadTask:
         raise ValueError("task record contains an invalid source sensitivity flag")
     for name in ("alt_urls", "failed_urls"):
         candidate = getattr(task, name)
-        if not isinstance(candidate, list) or any(
-            not isinstance(item, str) for item in candidate
-        ):
+        if not isinstance(candidate, (list, tuple)):
             raise ValueError("task record contains an invalid fallback url list")
+        normalized: List[str] = []
+        for item in candidate:
+            if isinstance(item, dict):
+                # 旧版本把结构化候选对象（含 url 键）写进了 alt_urls；
+                # 读取时归一化为 url 字符串，避免存量数据拒载。
+                item = item.get("url")
+            if not isinstance(item, str):
+                raise ValueError("task record contains an invalid fallback url list")
+            url = item.strip()
+            if url and url not in normalized:
+                normalized.append(url)
+        setattr(task, name, normalized)
     if task.control_action not in {"", "pause", "remove"}:
         raise ValueError("task record contains an unknown control action")
     return task
@@ -558,6 +571,40 @@ class _SerialDownloadQueue:
             raise RuntimeError(f"{source_key} 损坏且隔离失败") from exc
         raise ValueError(f"{source_key} 持久化数据损坏：{reason}")
 
+    def _quarantine_and_skip(
+        self,
+        source_key: str,
+        quarantine_key: str,
+        payload: object,
+        reason: str,
+    ) -> None:
+        """Back up corrupt data, notify loudly, and continue with clean state.
+
+        A single bad record must never keep the plugin from loading: the
+        original payload stays quarantined for inspection while the queue
+        starts empty (the next ``_write`` purges the corrupt records).
+        """
+        try:
+            self._save(
+                quarantine_key,
+                {
+                    "schema": self.PERSISTENCE_SCHEMA,
+                    "source_key": source_key,
+                    "reason": reason,
+                    "payload": payload,
+                },
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{source_key} 损坏且隔离失败") from exc
+        try:
+            self._notify(
+                "LunaTV 持久化数据已隔离",
+                f"{source_key} 数据损坏（{reason}），已备份到隔离区并跳过；"
+                "相关任务状态已重置。",
+            )
+        except Exception:
+            pass
+
     def _load_versioned_items(
         self,
         source_key: str,
@@ -570,22 +617,25 @@ class _SerialDownloadQueue:
         if isinstance(raw, list):
             return raw, list(raw)
         if not isinstance(raw, dict):
-            self._quarantine_payload(
+            self._quarantine_and_skip(
                 source_key, quarantine_key, raw, "payload is not a list or envelope"
             )
+            return raw, []
         if set(raw) != {"schema", "items"}:
-            self._quarantine_payload(
+            self._quarantine_and_skip(
                 source_key, quarantine_key, raw, "envelope fields are invalid"
             )
+            return raw, []
         if type(raw.get("schema")) is not int or raw.get("schema") != self.PERSISTENCE_SCHEMA:
             self._quarantine_payload(
                 source_key, quarantine_key, raw, "schema is unknown"
             )
         items = raw.get("items")
         if not isinstance(items, list):
-            self._quarantine_payload(
+            self._quarantine_and_skip(
                 source_key, quarantine_key, raw, "envelope items are not a list"
             )
+            return raw, []
         return raw, list(items)
 
     def _recover_interrupted_tasks(self) -> None:
@@ -734,7 +784,8 @@ class _SerialDownloadQueue:
             try:
                 tasks.append(_download_task_from_payload(item))
             except ValueError as exc:
-                self._quarantine_payload(
+                # 备份后跳过坏记录：宁可丢一条任务也不能让插件无法启动。
+                self._quarantine_and_skip(
                     self.DATA_KEY,
                     self.DATA_QUARANTINE_KEY,
                     raw,

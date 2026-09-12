@@ -941,7 +941,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "lunatvsource.png"
-    plugin_version = "0.4.89"
+    plugin_version = "0.4.90"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "lunatvsource_"
@@ -5591,7 +5591,6 @@ class LunaTVSource(_PluginBase):
                         ambiguous_results.append((result, association))
                         continue
 
-                    episode_candidates: Dict[Tuple[int, int], List[CmsEpisode]] = {}
                     start_episode, total_episode = self._subscription_episode_bounds(
                         subscribe,
                         association,
@@ -5623,6 +5622,19 @@ class LunaTVSource(_PluginBase):
                             conflict_urls.extend(
                                 candidate.url for candidate in unique_candidates[key]
                             )
+
+                    if self._source_fallback_enabled():
+                        # 整季订阅分支在 unique_candidates 里持有的是
+                        # CmsEpisode 对象；候选表必须存 url 字符串，否则
+                        # alt_urls 会把对象字典落盘，重启后严格校验拒载。
+                        for _key, _cands in unique_candidates.items():
+                            _merged = episode_candidates.setdefault(_key, [])
+                            _seen = set(_merged)
+                            for _cand in _cands:
+                                _url = str(_cand.url or "").strip()
+                                if _url and _url not in _seen:
+                                    _merged.append(_url)
+                                    _seen.add(_url)
 
                     conflict_heights = self._probe_resource_urls(conflict_urls)
                     selected_episodes: List[CmsEpisode] = []

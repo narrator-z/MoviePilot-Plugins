@@ -392,6 +392,51 @@ res11 = qf11._requeue_with_fallback(task_f11, "下载无进展超过 10 分钟")
 check("卡住且无候选时换源返回 False（有界，终态 failed）", res11 is False, res11)
 check("无候选时不产生新 url", task_f11.url == "http://a/1.m3u8", task_f11.url)
 
+# G1 旧版字典形态 alt_urls 读取时归一化为 url 字符串（0.4.89 整季订阅落盘事故）
+legacy = dl.DownloadTask(
+    task_id="g1", source_key="lunatv", media_id="src:1", title="辐射", year="2024",
+    media_type="tv", season=1, episode=1, url="http://a/1.m3u8", root="/m",
+    alt_urls=[{"season": 1, "episode": 1, "label": "第01集",
+               "url": "http://b/1.m3u8", "season_known": True}],
+)
+t_g1 = dl._download_task_from_payload(json.loads(json.dumps(legacy.to_dict())))
+check("旧版字典 alt_urls 归一化为字符串", t_g1.alt_urls == ["http://b/1.m3u8"], t_g1.alt_urls)
+
+# G2 坏记录不再炸启动：备份隔离后跳过，其余记录照常加载
+def _stub_queue(load_map):
+    q = object.__new__(dl.DownloadQueue)
+    saved = {}
+    notified = []
+    q._load = lambda key, default=None: load_map.get(key, default)
+    q._save = lambda key, value: saved.update({key: value})
+    q._notify = lambda title, body: notified.append((title, body))
+    return q, saved, notified
+
+good_payload = json.loads(json.dumps(dl.DownloadTask(
+    task_id="g2", source_key="lunatv", media_id="src:1", title="正常任务", year="2024",
+    media_type="tv", season=1, episode=2, url="http://a/2.m3u8", root="/m",
+).to_dict()))
+bad_record = dict(good_payload, task_id="g2bad", alt_urls=[123])
+q_g2, saved_g2, notes_g2 = _stub_queue({
+    "download_tasks_v1": {"schema": 1, "items": [good_payload, bad_record]},
+})
+tasks_g2 = q_g2._read()
+check("坏记录被跳过后其余任务照常加载",
+      [t.task_id for t in tasks_g2] == ["g2"], [t.task_id for t in tasks_g2])
+check("坏记录原始 payload 已备份到隔离区",
+      "download_tasks_v1_quarantine" in saved_g2, list(saved_g2))
+check("隔离备份记录了损坏原因",
+      "task record 1" in saved_g2.get("download_tasks_v1_quarantine", {}).get("reason", ""),
+      saved_g2.get("download_tasks_v1_quarantine", {}).get("reason"))
+check("坏记录跳过时发出通知", len(notes_g2) == 1, notes_g2)
+
+# G3 信封整体损坏（非 list/envelope）→ 隔离后空队列启动，不抛异常
+q_g3, saved_g3, notes_g3 = _stub_queue({"download_tasks_v1": "garbage"})
+tasks_g3 = q_g3._read()
+check("信封损坏时返回空任务列表且不抛异常", tasks_g3 == [], tasks_g3)
+check("信封损坏原始数据已隔离备份",
+      "download_tasks_v1_quarantine" in saved_g3, list(saved_g3))
+
 print()
 print("=" * 72)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
