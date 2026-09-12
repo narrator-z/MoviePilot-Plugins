@@ -170,6 +170,13 @@ except Exception:  # pragma: no cover - standalone tests
     _HostMediaChain = None
     _HostMetaInfo = None
 
+try:  # Isolated on purpose: a host without this helper must not disable the trio above.
+    from app.application.directory import (
+        build_media_download_path as _build_media_download_path,
+    )
+except Exception:  # pragma: no cover - standalone tests
+    _build_media_download_path = None
+
 LOGGER = logging.getLogger("LunaTVSource")
 
 
@@ -926,7 +933,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "https://raw.githubusercontent.com/OneBigMoon/moviepilot-v3-lunatv-source/master/icons/lunatvsource.png"
-    plugin_version = "0.4.84"
+    plugin_version = "0.4.85"
     plugin_author = "OneBigMoon"
     author_url = "https://github.com/OneBigMoon"
     plugin_config_prefix = "lunatvsource_"
@@ -2602,13 +2609,16 @@ class LunaTVSource(_PluginBase):
         }
         for target, names in (
             ("media_category_id", ("category_id", "media_category_id", "id")),
-            ("media_category", ("category", "media_category", "name", "label", "path")),
+            ("media_category", ("category_path", "category", "media_category", "name", "label", "path")),
             ("classification_rule_id", ("rule_id", "classification_rule_id")),
             ("classification_policy_revision", ("policy_revision", "classification_policy_revision", "revision")),
             ("classification_source", ("source", "classification_source")),
         ):
             for name in names:
                 value = _field(effective, name, None)
+                if value in (None, ""):
+                    # 策略修订号等字段挂在求值结果上，而不在 effective 选择项里。
+                    value = _field(classification, name, None)
                 if value not in (None, ""):
                     payload[target] = (
                         cls._classification_path(value)
@@ -2992,7 +3002,216 @@ class LunaTVSource(_PluginBase):
 
         return "", ""
 
-    def _effective_root(self, subscribe: Any = None, media_type: str = "tv") -> str:
+    # ------------------------------------------------------------------
+    # 宿主目录决策 / 宿主媒体事实
+    #
+    # 设计原则：插件不再自己挑目录、也不再自己造媒体事实。
+    #   · 身份交给宿主识别链（返回对象自带完整 tmdb 事实与二级分类）；
+    #   · 目录决策只经过 DirectoryHelper.get_dir(media) 这一个入口；
+    #   · 三条宿主不成立的路（无识别 / 无目录 / 无 media）保留旧行为兜底，
+    #     只降级不放弃，文件永远保留。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _directory_usable(directory: Any) -> bool:
+        """整理链收到空 library_path 会直接抛 ValueError，先在决策阶段过滤掉。"""
+
+        if directory is None:
+            return False
+        return bool(str(getattr(directory, "library_path", "") or "").strip())
+
+    def _resolve_directory(self, media: Any) -> Any:
+        """把目录决策完全交给宿主，返回可用的 TransferDirectoryConf（或 None）。
+
+        仅使用 ``DirectoryHelper.get_dir(media)``——它是宿主唯一带分类匹配的入口。
+        注意 ``media=None`` 时绝不能调用：``media_match_rank(media=None)`` 对全部
+        目录返回同一档位，会按 priority 命中第一个目录（常见是「动画电影」），
+        属于必然错归，此时一律返回 None 让调用方走兜底。
+        """
+
+        if media is None or _HostDirectoryHelper is None:
+            return None
+        try:
+            helper = _HostDirectoryHelper()
+        except Exception as exc:  # noqa: BLE001 - 宿主不可用不应中断下载
+            self._logger.debug("LunaTV 宿主目录助手不可用：%s", exc)
+            return None
+        # 第一跳按用户配置匹配；第二跳放宽「未启用监控」过滤（比按目录名猜更可靠）。
+        for include_unsorted in (False, True):
+            try:
+                directory = helper.get_dir(media=media, include_unsorted=include_unsorted)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.debug("LunaTV 宿主目录匹配失败：%s", exc)
+                continue
+            if directory is None:
+                continue
+            if not self._directory_usable(directory):
+                self._logger.warning(
+                    "LunaTV 命中目录 %s 未设置媒体库路径，跳过该目录",
+                    getattr(directory, "name", "") or "",
+                )
+                continue
+            if include_unsorted:
+                self._logger.info(
+                    "LunaTV 已把未勾选「监控」的目录 %s 作为整理目标",
+                    getattr(directory, "name", "") or "",
+                )
+            return directory
+        return None
+
+    def _recognize_media(
+        self,
+        title: str,
+        year: str,
+        host_type: Any,
+        media_source: Any,
+        media_id: Optional[str],
+    ) -> Any:
+        """调用宿主识别链，返回带完整 tmdb 事实的 MediaInfo（宿主已自动完成分类）。
+
+        不要在这里自己拼 ``MediaInfo(tmdb_info=...)``：``__post_init__`` 会用
+        ``tmdb_info`` 重投影身份，载荷缺少 ``"id"`` 时 ``media_source``/``media_id``
+        会被清空，随后分类事实构造失败 → 静默落「未分类」。
+        """
+
+        if _HostMediaChain is None:
+            return None
+        meta = None
+        if not media_id:
+            meta = self._host_meta_info(title, year)
+            if meta is None:
+                return None
+        try:
+            return _HostMediaChain().recognize_media(
+                meta=meta,
+                mtype=host_type,
+                media_source=media_source,
+                media_id=media_id,
+                cache=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 识别失败只降级
+            self._logger.debug("LunaTV 宿主媒体识别失败：%s", exc)
+            return None
+
+    def _host_media_info(self, task: DownloadTask) -> Any:
+        """三级取源拿宿主媒体事实；全部失败返回 None，调用方回退旧行为。
+
+        ① task 已带宿主身份（订阅创建时写入的 ``themoviedb:<id>``，最精确）；
+        ② 标题/年份交给宿主，按**用户自己配置的数据源**识别；
+        ③ 插件自身的 TMDB 关联（老行为，仅当前两级失败才用）。
+        """
+
+        if _HostMediaChain is None:
+            return None
+        host_type = self._host_media_type(task.media_type)
+        source, media_id = self._task_media_identity(task)
+        if media_id and _enum_value(source) != PLUGIN_MEDIA_SOURCE:
+            media = self._recognize_media(
+                getattr(task, "title", ""),
+                getattr(task, "year", ""),
+                host_type,
+                self._host_media_source_value(_enum_value(source)),
+                media_id,
+            )
+            if media is not None:
+                return media
+        media = self._recognize_media(
+            getattr(task, "title", ""), getattr(task, "year", ""), host_type, None, None
+        )
+        if media is not None:
+            return media
+        tmdb_source = self._tmdb_source()
+        if tmdb_source is not None:
+            media = self._recognize_media(
+                getattr(task, "title", ""),
+                getattr(task, "year", ""),
+                host_type,
+                tmdb_source,
+                None,
+            )
+            if media is not None:
+                return media
+        return None
+
+    def _association_media_info(self, media_type: str, association: Any) -> Any:
+        """用订阅/搜索结果已有的 TMDB 关联换取宿主 MediaInfo（识别缓存命中，成本低）。"""
+
+        if not isinstance(association, dict):
+            return None
+        media_id = str(
+            association.get("media_id") or association.get("tmdb_id") or ""
+        ).strip()
+        source = _enum_value(association.get("media_source"))
+        if not media_id or source == PLUGIN_MEDIA_SOURCE:
+            return None
+        return self._recognize_media(
+            "",
+            "",
+            self._host_media_type(media_type),
+            self._host_media_source_value(source),
+            media_id,
+        )
+
+    def _categorized_download_root(self, root: str, media: Any) -> str:
+        """仅当 root 正好是某个配置下载目录的根时才追加分类，否则原样返回。
+
+        宿主语义（``get_download_dir_by_save_path``）：只有「配置根本身」继承自动
+        分类，根目录下的自定义子目录保持调用方路径。这里不自己造路径。
+        """
+
+        root = str(root or "").strip()
+        if (
+            not root
+            or media is None
+            or _HostDirectoryHelper is None
+            or _build_media_download_path is None
+        ):
+            return root
+        try:
+            helper = _HostDirectoryHelper()
+            directory = helper.get_download_dir_by_save_path(media, root)
+            if directory is None:
+                return root
+            return _build_media_download_path(
+                Path(root), directory, media, helper
+            ).as_posix()
+        except Exception as exc:  # noqa: BLE001 - 分类追加失败沿用原路径
+            self._logger.debug("LunaTV 下载目录追加分类失败，沿用原路径：%s", exc)
+            return root
+
+    def _effective_root(
+        self,
+        subscribe: Any = None,
+        media_type: str = "tv",
+        media: Any = None,
+    ) -> str:
+        """解析下载暂存根。
+
+        ``media`` 可选：传了才可能追加二级分类子目录（与片源下载一致）；不传时
+        行为与旧版完全一致，保证其余调用点零回归。
+        """
+
+        explicit = str(self._config.get("download_root") or "").strip()
+        if explicit:
+            return self._categorized_download_root(explicit, media)
+        save_path = str(getattr(subscribe, "save_path", "") or "").strip()
+        if save_path:
+            return self._categorized_download_root(save_path, media)
+        if media is not None:
+            directory = self._resolve_directory(media)
+            download_path = (
+                str(getattr(directory, "download_path", "") or "").strip()
+                if directory is not None
+                else ""
+            )
+            if download_path:
+                return self._categorized_download_root(download_path, media)
+        directory_info = self._system_directory_info(media_type)
+        return str(directory_info.get("download_path") if directory_info else "").strip()
+
+    def _legacy_effective_root(self, subscribe: Any = None, media_type: str = "tv") -> str:
+        """旧下载根解析逻辑，仅在宿主目录决策不可用时使用。"""
+
         explicit = str(self._config.get("download_root") or "").strip()
         if explicit:
             return explicit
@@ -3337,7 +3556,13 @@ class LunaTVSource(_PluginBase):
         return False
 
     def _native_transfer(self, task: DownloadTask, output: str) -> str:
-        """让 MoviePilot 原生整理链接管已下载文件；不可用时保留直写结果。"""
+        """让 MoviePilot 原生整理链接管已下载文件；不可用时保留直写结果。
+
+        与片源下载一致的链路：媒体身份 → 宿主识别链（返回对象自带二级分类）→
+        ``DirectoryHelper.get_dir(media)`` 选目录 → ``do_transfer`` 落盘。
+        插件不再自己挑目录，也不再自己造媒体事实。
+        """
+
         if _HostStorageChain is None or _HostTransferChain is None:
             return "fallback:host-chain-unavailable"
         if task.mode == "strm":
@@ -3346,84 +3571,59 @@ class LunaTVSource(_PluginBase):
             fileitem = _HostStorageChain().get_file_item(storage="local", path=Path(output))
             if not fileitem:
                 return "fallback:file-not-found"
-            media_source, media_id = self._task_media_identity(task)
-            directory = self._system_directory_info(task.media_type, task.root)
-            target_path = str((directory or {}).get("library_path") or "").strip()
-            transfer_type = str((directory or {}).get("transfer_type") or "").strip()
-            if not target_path:
-                target_path, inferred_transfer_type = self._auto_library_target(task.media_type, task.root)
-                transfer_type = transfer_type or inferred_transfer_type
-            elif not transfer_type:
-                transfer_type = _AUTO_TRANSFER_TYPE
-            if not target_path:
-                return "fallback:no-library-target"
-            try:
-                if Path(target_path).expanduser().resolve() == Path(task.root).expanduser().resolve():
-                    return "fallback:library-equals-download-root"
-            except OSError:
-                pass
-            transfer_chain = _HostTransferChain()
-            host_media_source = self._host_media_source_value(media_source)
-            host_media_type = self._host_media_type(task.media_type)
-            scrape = _bool(self._config.get("generate_nfo"), False)
-            movie_meta = (
-                self._host_meta_info(
-                    getattr(task, "title", ""),
-                    getattr(task, "year", ""),
+            media = self._host_media_info(task)
+            directory = self._resolve_directory(media)
+            if directory is None:
+                self._logger.warning(
+                    "LunaTV 未取得宿主目录决策（识别%s），回退旧整理路径 task=%s",
+                    "成功" if media is not None else "失败",
+                    getattr(task, "task_id", ""),
                 )
+                return self._legacy_native_transfer(task, output, fileitem)
+
+            transfer_chain = _HostTransferChain()
+            host_media_type = self._host_media_type(task.media_type)
+            transfer_type = (
+                str(getattr(directory, "transfer_type", "") or "").strip()
+                or _AUTO_TRANSFER_TYPE
+            )
+            # None 表示跟随目录自身的刮削设置；只有插件显式要求才强制开启。
+            scrape = True if _bool(self._config.get("generate_nfo"), False) else None
+            media_source, media_id = self._task_media_identity(task)
+            movie_meta = (
+                self._host_meta_info(getattr(task, "title", ""), getattr(task, "year", ""))
                 if task.media_type != "tv"
                 else None
             )
-            direct_transfer = getattr(transfer_chain, "do_transfer", None)
-            if movie_meta is not None and callable(direct_transfer) and transfer_type:
-                # MoviePilot's generic manual entrypoint reparses the source
-                # path.  Some host/parser combinations synthesize S01/E01 for
-                # an otherwise season-free movie and therefore select the TV
-                # rename template.  Supply authoritative movie metadata to
-                # the stable transfer entrypoint so only TV tasks can carry
-                # season/episode information into the library layout.
-                if hasattr(movie_meta, "type"):
-                    movie_meta.type = host_media_type
-                for field_name in (
-                    "begin_season",
-                    "end_season",
-                    "total_season",
-                    "begin_episode",
-                    "end_episode",
-                    "total_episode",
-                ):
-                    if hasattr(movie_meta, field_name):
-                        setattr(movie_meta, field_name, None)
-                state, message = direct_transfer(
-                    fileitem=fileitem,
-                    meta=movie_meta,
-                    target_storage="local",
-                    target_path=Path(target_path),
-                    transfer_type=transfer_type,
-                    media_source=host_media_source,
-                    media_id=media_id,
-                    mtype=host_media_type,
-                    season=None,
-                    force=False,
-                    background=False,
-                    manual=True,
-                    scrape=scrape,
-                    sync_extra_files=True,
-                )
-            else:
-                state, message = transfer_chain.manual_transfer(
-                    fileitem=fileitem,
-                    target_storage="local",
-                    target_path=Path(target_path),
-                    transfer_type=transfer_type,
-                    media_source=host_media_source,
-                    media_id=media_id,
-                    mtype=host_media_type,
-                    season=task.season if task.media_type == "tv" else None,
-                    force=False,
-                    background=False,
-                    scrape=scrape,
-                )
+            if movie_meta is not None and hasattr(movie_meta, "type"):
+                movie_meta.type = host_media_type
+            obtain_images = getattr(transfer_chain, "obtain_images", None)
+            if callable(obtain_images):
+                try:
+                    obtain_images(mediainfo=media)
+                except Exception as exc:  # noqa: BLE001 - 仅影响海报，不影响整理
+                    self._logger.debug("LunaTV 获取媒体图片失败：%s", exc)
+            state, message = transfer_chain.do_transfer(
+                fileitem=fileitem,
+                meta=movie_meta,
+                mediainfo=media,
+                mtype=host_media_type,
+                media_source=self._host_media_source_value(media_source),
+                media_id=media_id,
+                # ★ 显式给出目录：宿主不再自算目标，彻底绕开 src_path 收窄导致的拒整理
+                target_directory=directory,
+                # 跟随 directory.library_storage（网盘场景才通用）
+                target_storage=None,
+                # ★ 必须为 None：非空会走「手动指定路径」分支并平铺，不追加分类子目录
+                target_path=None,
+                transfer_type=transfer_type,
+                scrape=scrape,
+                season=task.season if task.media_type == "tv" else None,
+                force=False,
+                background=False,
+                manual=True,
+                sync_extra_files=True,
+            )
             if state:
                 if transfer_type.casefold() == "move":
                     source_path = Path(output)
@@ -3433,12 +3633,117 @@ class LunaTVSource(_PluginBase):
                         time.sleep(0.05)
                     if source_path.exists():
                         return "fallback:move-source-still-exists"
+                self._apply_task_classification(
+                    task, self._media_classification_snapshot(media)
+                )
                 return "moviepilot"
             self._logger.warning("MoviePilot 原生整理未完成，保留直写文件：%s", message)
             return f"fallback:{message}"
         except Exception as exc:
             self._logger.warning("MoviePilot 原生整理失败，保留直写文件：%s", exc)
             return f"fallback:{exc}"
+
+    def _legacy_native_transfer(
+        self, task: DownloadTask, output: str, fileitem: Any
+    ) -> str:
+        """旧整理路径：按媒体类型取第一个同类型媒体库目录，并以 target_path 传入。
+
+        只在宿主无法给出可用目录（识别失败 / 未配置目录 / 目录缺媒体库路径）时使用，
+        保证整理不中断、文件不丢失。
+        """
+
+        media_source, media_id = self._task_media_identity(task)
+        directory = self._system_directory_info(task.media_type, task.root)
+        target_path = str((directory or {}).get("library_path") or "").strip()
+        transfer_type = str((directory or {}).get("transfer_type") or "").strip()
+        if not target_path:
+            target_path, inferred_transfer_type = self._auto_library_target(
+                task.media_type, task.root
+            )
+            transfer_type = transfer_type or inferred_transfer_type
+        elif not transfer_type:
+            transfer_type = _AUTO_TRANSFER_TYPE
+        if not target_path:
+            return "fallback:no-library-target"
+        try:
+            if Path(target_path).expanduser().resolve() == Path(task.root).expanduser().resolve():
+                return "fallback:library-equals-download-root"
+        except OSError:
+            pass
+        transfer_chain = _HostTransferChain()
+        host_media_source = self._host_media_source_value(media_source)
+        host_media_type = self._host_media_type(task.media_type)
+        scrape = _bool(self._config.get("generate_nfo"), False)
+        movie_meta = (
+            self._host_meta_info(
+                getattr(task, "title", ""),
+                getattr(task, "year", ""),
+            )
+            if task.media_type != "tv"
+            else None
+        )
+        direct_transfer = getattr(transfer_chain, "do_transfer", None)
+        if movie_meta is not None and callable(direct_transfer) and transfer_type:
+            # MoviePilot's generic manual entrypoint reparses the source
+            # path.  Some host/parser combinations synthesize S01/E01 for
+            # an otherwise season-free movie and therefore select the TV
+            # rename template.  Supply authoritative movie metadata to
+            # the stable transfer entrypoint so only TV tasks can carry
+            # season/episode information into the library layout.
+            if hasattr(movie_meta, "type"):
+                movie_meta.type = host_media_type
+            for field_name in (
+                "begin_season",
+                "end_season",
+                "total_season",
+                "begin_episode",
+                "end_episode",
+                "total_episode",
+            ):
+                if hasattr(movie_meta, field_name):
+                    setattr(movie_meta, field_name, None)
+            state, message = direct_transfer(
+                fileitem=fileitem,
+                meta=movie_meta,
+                target_storage="local",
+                target_path=Path(target_path),
+                transfer_type=transfer_type,
+                media_source=host_media_source,
+                media_id=media_id,
+                mtype=host_media_type,
+                season=None,
+                force=False,
+                background=False,
+                manual=True,
+                scrape=scrape,
+                sync_extra_files=True,
+            )
+        else:
+            state, message = transfer_chain.manual_transfer(
+                fileitem=fileitem,
+                target_storage="local",
+                target_path=Path(target_path),
+                transfer_type=transfer_type,
+                media_source=host_media_source,
+                media_id=media_id,
+                mtype=host_media_type,
+                season=task.season if task.media_type == "tv" else None,
+                force=False,
+                background=False,
+                scrape=scrape,
+            )
+        if state:
+            if transfer_type.casefold() == "move":
+                source_path = Path(output)
+                for _ in range(20):
+                    if not source_path.exists():
+                        break
+                    time.sleep(0.05)
+                if source_path.exists():
+                    return "fallback:move-source-still-exists"
+            return "moviepilot"
+        self._logger.warning("MoviePilot 原生整理未完成，保留直写文件：%s", message)
+        return f"fallback:{message}"
 
     def _record_native_history(self, task: DownloadTask, output: str) -> None:
         """把成功文件写入 MoviePilot 下载历史，供订阅详情读取。数据库不可用时不影响下载。"""
@@ -5291,7 +5596,11 @@ class LunaTVSource(_PluginBase):
                     # common case; otherwise leave it for manual selection.
                     skipped_ambiguous += 1
                     continue
-                root = self._effective_root(subscribe, result.media_type)
+                root = self._effective_root(
+                    subscribe,
+                    result.media_type,
+                    media=self._association_media_info(result.media_type, association),
+                )
                 if not root:
                     skipped_no_directory += 1
                     continue
