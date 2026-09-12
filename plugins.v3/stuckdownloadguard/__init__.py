@@ -3,12 +3,14 @@
 下载守卫（StuckDownloadGuard）
 
 监控下载管理模块中的下载任务：
-  - 若某下载任务「活跃下载中且 下载速度=0（不含排队时间）」持续达到设定时长（默认 30 分钟），
-    则降低其优先级并排至下载队列队尾；
+  - 异常态（error/缺文件/未知）僵尸种子：已彻底失去下载能力、不会自行恢复，
+    一经发现立即停止并清理（订阅来源顺带重新搜索），不再走任何重试观察窗口。
+  - 活跃下载中且 下载速度=0（不含排队时间）持续达到设定时长（默认 30 分钟）：
+    若「无做种人」则直接尝试切换下载源/清理（重试或排至队尾都无济于事，跳空等）；
+    若「有做种人」则先降级排至队尾重试，重试无效（默认 3 次）再切换下载源/清理。
     注：进度≈0 或中途卡住（如下到一半却 0 速度）均视为卡死，同样接管。
-  - 连续多次（默认 3 次）降级重试仍无进展（重试无效），则停止种子、清理下载任务，并尝试重新搜索并切换下载源
-    （订阅来源通过订阅链重新搜索、非订阅来源跨索引器重搜更优种子并替换原种子）；
-  - 若切换下载源不可用，则仅停止并清理（订阅来源仍会顺带重新搜索）。
+  - 切换下载源：订阅来源通过订阅链重新搜索、非订阅来源跨索引器重搜更优种子并替换原种子；
+    若切换不可用，则仅停止并清理（订阅来源仍会顺带重新搜索）。
 
 说明：
   - 为准确区分「排队中」与「下载中」，本插件直接调用下载器原生客户端（qBittorrent / Transmission）
@@ -79,7 +81,7 @@ class StuckDownloadGuard(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页
@@ -315,6 +317,7 @@ class StuckDownloadGuard(_PluginBase):
                 "raw_state": (tor.get("state") or "").lower(),
                 "progress": (tor.get("progress") or 0) * 100,
                 "dl_speed": tor.get("dlspeed") or 0,
+                "num_seeds": tor.get("num_seeds") or 0,
             })
         return out
 
@@ -338,6 +341,7 @@ class StuckDownloadGuard(_PluginBase):
                 "raw_state": getattr(tor, "status", None),
                 "progress": (getattr(tor, "percent_done", 0) or 0) * 100,
                 "dl_speed": getattr(tor, "rate_download", 0) or 0,
+                "num_seeds": getattr(tor, "peers_connected", 0) or 0,
             })
         return out
 
@@ -444,11 +448,16 @@ class StuckDownloadGuard(_PluginBase):
                 rec["downloader"] = t["downloader"]
 
                 if stuck:
-                    if rec["last_ts"] is not None:
-                        rec["active_stuck"] += now - rec["last_ts"]
-                    rec["last_ts"] = now
-                    if rec["active_stuck"] >= self._inactive_minutes * 60:
-                        self.__handle_stuck(h, rec, t, clients)
+                    if fault:
+                        # 异常态（error/缺文件/未知）已彻底失去下载能力，不会自行恢复，
+                        # 无需像活跃卡顿那样等待观察窗口，直接清理（订阅源顺带重搜）。
+                        self.__handle_fault(h, rec, t, clients)
+                    else:
+                        if rec["last_ts"] is not None:
+                            rec["active_stuck"] += now - rec["last_ts"]
+                        rec["last_ts"] = now
+                        if rec["active_stuck"] >= self._inactive_minutes * 60:
+                            self.__handle_stuck(h, rec, t, clients)
                 elif queued:
                     # 排队中：暂停计时（不计入卡顿时长），不清零
                     rec["last_ts"] = None
@@ -465,31 +474,56 @@ class StuckDownloadGuard(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】监控出错：{str(e)} - {traceback.format_exc()}")
 
+    def __handle_fault(self, hash_str: str, rec: dict, t: dict, clients: Dict[str, dict]):
+        """
+        异常态（error/缺文件/unknown）僵尸任务处理：此类种子已彻底失去下载能力、
+        不会自行恢复，故不走「降级重试」观察窗口，直接停止并清理（订阅源顺带重搜）。
+        """
+        self.__notify(
+            action="异常状态直接清理",
+            title=rec.get("title"),
+            hash_str=hash_str,
+            extra=f"种子处于异常态（{t['raw_state']}，出错/缺文件），已停止并清理"
+                  f"（订阅源会顺带重新搜索）",
+        )
+        self.__escalate(clients, t["downloader"], hash_str, rec)
+        self._states.pop(hash_str, None)
+
     def __handle_stuck(self, hash_str: str, rec: dict, t: dict, clients: Dict[str, dict]):
         """
         达到卡顿时长后的处理（重试 → 换源 → 清理）：
-          1) 降级：降优先级并排至下载队列队尾（先腾出带宽/队列，给其它下载让路）；
-          2) 重试窗口：连续多次（默认 3 次）仍无进展，视为「重试无效」；
-          3) 重试无效 → 「切换下载源/种子」：通知 MoviePilot 重新搜索并替换原种子
+          1) 无做种人：重试/排至队尾都不会让进度前进，直接尝试换源或清理，跳过重试空等；
+          2) 有做种人但仍卡住：先降级排尾（重试窗口），给其它下载让路并观察；
+          3) 重试无效（达上限）→ 「切换下载源/种子」：通知 MoviePilot 重新搜索并替换原种子
              （订阅来源走订阅链重搜、非订阅来源跨索引器重搜更优种子并替换）；
           4) 若切换不可用或失败，则升级为停止/清理（订阅源会顺带重新搜索）。
         注：卡顿判定不再区分进度，0 进度卡住与中途卡住同样适用；
             仅当「重试窗口用尽」才动用换源/清理，避免瞬时抖动即重搜。
         """
-        rec["retries"] = rec.get("retries", 0) + 1
-        _a, _q, fault = self.__classify_state(t["type"], t["raw_state"])
         is_zero = t["progress"] < _PROGRESS_ZERO_THRESHOLD
-        if fault:
-            phase = f"异常状态（{t['raw_state']}，出错/缺文件）"
-        elif is_zero:
+        if is_zero:
             phase = "0 进度卡住"
         else:
             phase = f"中途卡住（{t['progress']:.1f}%）"
 
-        # 1) 降级：降优先级并排至下载队列队尾
+        # 无做种人：重试 / 排至队尾都无济于事，直接换源或清理，避免无谓空等。
+        no_seeders = (t.get("num_seeds") or 0) == 0
+        if no_seeders:
+            switched = False
+            if self._switch_source:
+                switched = self.__switch_source(hash_str, rec, t, clients)
+            if switched:
+                self._states.pop(hash_str, None)
+                return
+            self.__escalate(clients, t["downloader"], hash_str, rec)
+            self._states.pop(hash_str, None)
+            return
+
+        # 有做种人但仍卡住：先降级排尾（重试窗口），给其它下载让路并观察是否恢复
+        rec["retries"] = rec.get("retries", 0) + 1
         self.__demote_and_move_tail(clients, t["downloader"], hash_str)
 
-        # 2) 尚未到重试上限：重置计时，开启下一轮观察窗口（让下载器排队喘息，先重试）
+        # 尚未到重试上限：重置计时，开启下一轮观察窗口（让下载器排队喘息，先重试）
         if rec["retries"] < self._max_retries:
             rec["active_stuck"] = 0.0
             rec["last_ts"] = time.time()
@@ -502,7 +536,7 @@ class StuckDownloadGuard(_PluginBase):
             )
             return
 
-        # 3) 重试无效 → 尝试切换下载源（通知 MP 重新搜索并替换原种子）
+        # 重试无效 → 尝试切换下载源（通知 MP 重新搜索并替换原种子）
         switched = False
         if self._switch_source:
             switched = self.__switch_source(hash_str, rec, t, clients)
@@ -511,7 +545,7 @@ class StuckDownloadGuard(_PluginBase):
             self._states.pop(hash_str, None)
             return
 
-        # 4) 换源失败/不可用 → 升级为停止并清理（订阅源顺带重新搜索）
+        # 换源失败/不可用 → 升级为停止并清理（订阅源顺带重新搜索）
         self.__escalate(clients, t["downloader"], hash_str, rec)
         self._states.pop(hash_str, None)
 

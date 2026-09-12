@@ -7,10 +7,10 @@
   D2 换源时机反了——一卡住就尝试换源，且 switch_attempted 置 True 后永不重置，
      若首次因瞬时抖动失败就再也不会换源，只能干等 max_retries 到顶。
 
-1.1.1 修复后预期行为（重试 → 换源 → 清理）：
-  - 活跃下载中且速度=0 即视为卡死，不区分进度；
-  - 每轮先降级排尾（重试窗口），重试次数未达上限不动用换源；
-  - 重试无效（达 max_retries）才切换下载源；换源失败才升级为停止/清理。
+1.1.3 行为（异常态立即清 / 活跃卡顿按有无做种人分流）：
+  - 异常态（error/缺文件/unknown）僵尸：一经发现立即停止并清理，不进重试窗口；
+  - 活跃卡顿 + 无做种人：达时长后直接换源/清理，跳过无意义的降级重试；
+  - 活跃卡顿 + 有做种人：先降级排尾重试，重试无效（达 max_retries）才换源，换源失败才清理。
 """
 import sys
 import types
@@ -160,10 +160,11 @@ def make_guard(max_retries=3, switch_source=True):
     return g
 
 
-def torrent(progress, speed, state="stalleddl", dtype="qbittorrent", h="h1"):
+def torrent(progress, speed, state="stalleddl", dtype="qbittorrent", h="h1", num_seeds=5):
     return {
         "hash": h, "title": "测试剧集 S01E01", "downloader": "qb",
         "type": dtype, "raw_state": state, "progress": progress, "dl_speed": speed,
+        "num_seeds": num_seeds,
     }
 
 
@@ -283,19 +284,48 @@ check("H3 状态字典不再含 switch_attempted 残留字段",
 
 print()
 print("=" * 74)
-print("I. 异常态（error / missingFiles）僵尸任务也必须被接管")
+print("I. 异常态（error / missingFiles）僵尸任务：一经发现立即清理（不进重试窗口）")
 print("=" * 74)
 # 现场实证：qBittorrent 里 2 个 error + 1 个 missingfiles 常年停在 0%，
-# 旧版因不在 _QB_ACTIVE_STATES 内而永远无人处理。
+# 旧版因不在 _QB_ACTIVE_STATES 内而永远无人处理；1.1.2 起纳入 fault，1.1.3 改为立即清理。
 for st in ["error", "missingfiles", "unknown"]:
     g = make_guard()
     setattr(g, "_StuckDownloadGuard__collect",
             lambda s=st: ([torrent(progress=0.0, speed=0, state=s)], {}))
     g.monitor()
-    check(f"I-{st} 异常态被接管", len(g.calls["notify"]) == 1, str(g.calls["notify"]))
+    check(f"I-{st} 异常态被立即接管(无需等待)", len(g.calls["notify"]) == 1, str(g.calls["notify"]))
     if g.calls["notify"]:
-        check(f"I-{st} 文案标注异常状态", "异常状态" in g.calls["notify"][0]["extra"],
+        check(f"I-{st} 文案标注异常态", "异常态" in g.calls["notify"][0]["extra"],
               g.calls["notify"][0]["extra"])
+    check(f"I-{st} 异常态直接执行清理(不重试)", g.calls["escalate"] == 1, str(g.calls["escalate"]))
+    check(f"I-{st} 异常态不进入降级重试", g.calls["demote"] == 0, str(g.calls["demote"]))
+
+print()
+print("=" * 74)
+print("K. 活跃卡顿 + 无做种人：达时长后直接换源/清理，跳过降级重试空等")
+print("=" * 74)
+g = make_guard(max_retries=3, switch_source=True)
+g.switch_result = True
+setattr(g, "_StuckDownloadGuard__collect",
+        lambda: ([torrent(progress=0.0, speed=0, state="stalleddl", num_seeds=0)], {}))
+g.monitor()
+check("K1 无做种人直接尝试换源(不重试)", g.calls["switch"] == 1, str(g.calls["switch"]))
+check("K2 无做种人不执行降级排尾", g.calls["demote"] == 0, str(g.calls["demote"]))
+check("K3 换源成功则清理原种子", g.calls["escalate"] == 0 and "h1" not in g._states,
+      f"escalate={g.calls['escalate']} states={list(g._states)}")
+
+print()
+print("=" * 74)
+print("K'. 活跃卡顿 + 无做种人 + 换源失败：直接升级为停止清理")
+print("=" * 74)
+g = make_guard(max_retries=3, switch_source=True)
+g.switch_result = False
+setattr(g, "_StuckDownloadGuard__collect",
+        lambda: ([torrent(progress=50.0, speed=0, state="stalleddl", num_seeds=0)], {}))
+g.monitor()
+check("K'1 换源失败后直接清理", g.calls["escalate"] == 1, str(g.calls["escalate"]))
+check("K'2 不浪费降级重试", g.calls["demote"] == 0, str(g.calls["demote"]))
+check("K'3 清理后移除追踪", "h1" not in g._states)
 
 print()
 print("=" * 74)
