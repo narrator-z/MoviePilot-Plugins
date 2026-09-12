@@ -32,7 +32,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "6.0.2"
+    plugin_version = "6.0.3"
     # 插件作者
     plugin_author = "narrator-z"
     # 作者主页
@@ -413,8 +413,10 @@ class JackettExtend(_PluginBase):
             return []
         logger.info(f"【{self.plugin_name}】__parse_torznab_xml 请求: {url}")
         try:
-            ret = RequestUtils(timeout=60).get_res(url,
-                                                   proxies=settings.PROXY if self._proxy else None)
+            ret = RequestUtils(timeout=60,
+                               headers=headers or {},
+                               cookies=cookies).get_res(url,
+                                                       proxies=settings.PROXY if self._proxy else None)
         except Exception as e:
             logger.error(str(e))
             return []

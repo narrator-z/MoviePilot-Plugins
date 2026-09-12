@@ -109,13 +109,14 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持 Jackett 站点资源",
     "labels": "索引器,Jackett",
-    "version": "6.0.2",
+    "version": "6.0.3",
     "icon": "https://raw.githubusercontent.com/narrator-z/MoviePilot-Plugins/main/icons/Jackett_A.png",
     "author": "narrator-z",
     "level": 1,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "6.0.3": "修复 v3 侧 __parse_torznab_xml 丢弃 cookies/headers 参数：Jackett 开启 Admin password 后 torznab 接口要求会话 cookie，v3 调用点已传参、函数体却仍用旧的 RequestUtils(timeout=60) 构造请求，导致 search_torrents 恒为空（v2 侧此前已修，v3 漏改）。v2/v3 版本对齐。",
       "6.0.2": "迁移至 V3 插件格式（package.v3.json + plugins.v3/），声明最低系统版本 >=3.0.0；沿用既有代码经 V3 兼容层加载，无需改动。"
     }
   },

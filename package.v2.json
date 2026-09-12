@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持 Jackett 站点资源",
     "labels": "索引器,Jackett",
-    "version": "6.0.2",
+    "version": "6.0.3",
     "icon": "Jackett_A.png",
     "author": "narrator-z",
     "level": 1,
     "history": {
+      "v6.0.3": "版本与 v3 对齐。本次修复落在 v3 侧（torznab 请求漏带 Jackett 会话 cookie，导致开启 Admin password 后搜索恒空），v2 侧代码本就正确，无功能变更。",
       "v6.0.2": "同步清单版本号与插件代码内的 plugin_version（此前清单停留在 6.0.1、代码已是 6.0.2，双字段不一致会导致市场反复提示更新）",
       "v1.0": "适配MoviePilot V2 版本",
       "v1.1": "修复已知问题",
