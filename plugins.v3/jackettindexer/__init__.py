@@ -59,6 +59,7 @@ class JackettIndexer(_PluginBase):
     _enabled: bool = False
     _host: str = ""
     _api_key: str = ""
+    _password: str = ""
     _proxy: bool = False
     _cron: str = "0 0 */12 * *"  # Sync indexers every 12 hours
     _onlyonce: bool = False
@@ -98,6 +99,7 @@ class JackettIndexer(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._host = config.get("host", "").rstrip("/")
             self._api_key = config.get("api_key", "")
+            self._password = config.get("password", "")
             self._proxy = config.get("proxy", False)
             self._cron = config.get("cron", "0 0 */12 * *")
             self._onlyonce = config.get("onlyonce", False)
@@ -1630,6 +1632,28 @@ class JackettIndexer(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
+                                            'model': 'password',
+                                            'label': '密码',
+                                            'placeholder': '',
+                                            'hint': 'Jackett管理界面中配置的Admin密码，如未配置可为空；Jackett索引器仅需API密钥即可搜索',
+                                            'persistent-hint': True,
+                                            'type': 'password'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
                                             'model': 'cron',
                                             'label': '同步周期',
                                             'placeholder': '0 0 */12 * *',
@@ -1724,6 +1748,7 @@ class JackettIndexer(_PluginBase):
             "enabled": False,
             "host": "",
             "api_key": "",
+            "password": "",
             "proxy": False,
             "cron": "0 0 */12 * *",
             "onlyonce": False
