@@ -196,6 +196,11 @@ MIN_SOURCE_CHECK_MINUTES = 15
 MAX_SOURCE_CHECK_MINUTES = 1440
 SOURCE_HEALTH_QUERY = "1"
 SOURCE_HEALTH_WORKERS = 8
+# 下载失败自动换源：单个任务最多额外尝试多少个备选资源站。
+# 仅在 source_strategy="first" 下生效（"all" 本身就是多源并行）。
+DEFAULT_FALLBACK_MAX_SOURCES = 2
+MIN_FALLBACK_MAX_SOURCES = 0
+MAX_FALLBACK_MAX_SOURCES = 5
 DEFAULT_SOURCE_ALLOWLIST = (
     "suonizy.net,suoniapi.com,kuaichezy.com,caiji.kuaichezy.org,"
     "www.hongniuzy.com,www.hongniuzy2.com,wujinzy.net,wujinzy.me,"
@@ -933,7 +938,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "https://raw.githubusercontent.com/OneBigMoon/moviepilot-v3-lunatv-source/master/icons/lunatvsource.png"
-    plugin_version = "0.4.85"
+    plugin_version = "0.4.86"
     plugin_author = "OneBigMoon"
     author_url = "https://github.com/OneBigMoon"
     plugin_config_prefix = "lunatvsource_"
@@ -1419,6 +1424,35 @@ class LunaTVSource(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "source_fallback",
+                            "label": "下载失败自动换源",
+                            "hint": (
+                                "下载失败（403 / 源失效 / 连接异常）时，自动改用同一集在其它"
+                                "资源站的地址重试；全部候选都试完才判定为失败。"
+                                "仅在“按配置顺序选一个”策略下生效（“所有匹配源都排队”本身就是多源并行）。"
+                            ),
+                            "persistentHint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "fallback_max_sources",
+                            "label": "换源最多尝试几个备选站",
+                            "type": "number",
+                            "min": MIN_FALLBACK_MAX_SOURCES,
+                            "max": MAX_FALLBACK_MAX_SOURCES,
+                            "step": 1,
+                            "hint": (
+                                f"范围 {MIN_FALLBACK_MAX_SOURCES}–{MAX_FALLBACK_MAX_SOURCES}，"
+                                f"默认 {DEFAULT_FALLBACK_MAX_SOURCES}；0 表示关闭换源。"
+                            ),
+                            "persistentHint": True,
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "download_root",
@@ -1551,6 +1585,8 @@ class LunaTVSource(_PluginBase):
             "hls_ad_filter_regex": DEFAULT_HLS_AD_FILTER_REGEX,
             "mode": "download",
             "source_strategy": "first",
+            "source_fallback": True,
+            "fallback_max_sources": DEFAULT_FALLBACK_MAX_SOURCES,
             "download_root": "",
             "use_moviepilot_dirs": True,
             "ffmpeg_path": "ffmpeg",
@@ -1699,6 +1735,8 @@ class LunaTVSource(_PluginBase):
         "probe_allowed_private_ranges": "",
         "hls_ad_filter_regex": DEFAULT_HLS_AD_FILTER_REGEX,
             "source_strategy": "first",
+            "source_fallback": True,
+            "fallback_max_sources": DEFAULT_FALLBACK_MAX_SOURCES,
             "download_root": "",
             "use_moviepilot_dirs": True,
             "mode": "download",
@@ -5504,12 +5542,20 @@ class LunaTVSource(_PluginBase):
                     result.season_ambiguous and season > 0 and season_in_range
                 ):
                     matching_results.append((result, association))
+            episode_candidates: Dict[Tuple[int, int], List[str]] = {}
             if str(self._config.get("source_strategy") or "first") != "all":
                 matching_results = self._rank_subscription_results(
                     matching_results,
                     season=season,
                     subscribe=subscribe,
                 )
+                # 候选表必须在 top-1 截断【之前】建立：截断后只剩排名第一的
+                # 那个源，备选地址会在这一行被永久丢弃，后面无从换源。
+                if self._source_fallback_enabled():
+                    episode_candidates = self._collect_episode_candidates(
+                        matching_results,
+                        season=season,
+                    )
                 matching_results = matching_results[:1]
             if is_season_subscription:
                 selected_results: List[Tuple[CmsResult, Dict[str, Any]]] = []
@@ -5657,6 +5703,17 @@ class LunaTVSource(_PluginBase):
                             else f"{result.source_key}:{result.vod_id}"
                         ),
                     )
+                    # 备选源：同一集在其它资源站上的地址（已按排名顺序），
+                    # 剔除当前正在使用的那个，截断到配置上限。
+                    fallback_urls = [
+                        candidate_url
+                        for candidate_url in episode_candidates.get(
+                            (int(episode.season), int(episode.episode)), []
+                        )
+                        if candidate_url and candidate_url != task.url
+                    ]
+                    if fallback_urls:
+                        task.alt_urls = fallback_urls[: self._fallback_max_sources()]
                     if identity_source != PLUGIN_MEDIA_SOURCE and identity_id:
                         task.host_media_source = identity_source
                         task.host_media_id = identity_id
@@ -6760,6 +6817,54 @@ class LunaTVSource(_PluginBase):
             ),
             "",
         )
+
+    def _source_fallback_enabled(self) -> bool:
+        """是否启用「下载失败自动换源」（仅 source_strategy="first" 下有实际意义）。"""
+        value = self._config.get("source_fallback")
+        if value is None:
+            # 旧配置没有该键：跟随默认值（开启）。
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "off", "no", ""}
+        return bool(value)
+
+    def _fallback_max_sources(self) -> int:
+        """单个任务最多额外尝试几个备选资源站（0 = 不换源）。"""
+        try:
+            value = int(self._config.get("fallback_max_sources"))
+        except (TypeError, ValueError):
+            value = DEFAULT_FALLBACK_MAX_SOURCES
+        return max(MIN_FALLBACK_MAX_SOURCES, min(value, MAX_FALLBACK_MAX_SOURCES))
+
+    def _collect_episode_candidates(
+        self,
+        matching_results: List[Tuple[CmsResult, Dict[str, Any]]],
+        *,
+        season: int,
+    ) -> Dict[Tuple[int, int], List[str]]:
+        """把每一集在**全部**匹配源上的播放地址，按排名顺序收集成候选表。
+
+        必须在 ``matching_results[:1]`` 截断【之前】调用 —— 截断后只剩排名
+        第一的那个源，备选地址会在截断处被永久丢弃，后续无从换源。
+
+        :return: {(season, episode): [url, ...]}，同址去重并保持首次出现顺序。
+        """
+        table: Dict[Tuple[int, int], List[str]] = {}
+        for result, _association in matching_results:
+            for episode in getattr(result, "episodes", ()) or ():
+                if season > 0 and episode.season != season:
+                    continue
+                url = str(getattr(episode, "url", "") or "").strip()
+                if not url:
+                    continue
+                try:
+                    key = (int(episode.season), int(episode.episode))
+                except (TypeError, ValueError):
+                    continue
+                bucket = table.setdefault(key, [])
+                if url not in bucket:
+                    bucket.append(url)
+        return table
 
     def _rank_subscription_results(
         self,

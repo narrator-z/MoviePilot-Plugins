@@ -302,6 +302,15 @@ class DownloadTask:
     # Persist before MoviePilot moves the completed file so season totals stay
     # stable across plugin/container restarts.
     downloaded_bytes: int = 0
+    # Fallback sources for this episode, in the order the subscription results
+    # were ranked.  Only meaningful when the plugin runs with
+    # ``source_strategy="first"``: the top-1 truncation happens on the plugin
+    # side and the surviving alternates are handed over here.  An empty list
+    # (older persisted tasks included) means "no fallback" == legacy behavior.
+    alt_urls: List[str] = field(default_factory=list)
+    # Playback urls already attempted and failed.  Keeps the rotation
+    # idempotent so a task can never hammer the same source twice.
+    failed_urls: List[str] = field(default_factory=list)
 
     @classmethod
     def from_episode(
@@ -369,6 +378,46 @@ class DownloadTask:
         }
 
 
+def _normalize_url_list(value: object) -> List[str]:
+    """De-duplicated, order-preserving list of non-empty url strings."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    result: List[str] = []
+    for item in value:
+        url = str(item or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        result.append(url)
+    return result
+
+
+def _merge_fallback_urls(*groups: object) -> List[str]:
+    """Concatenate several url lists keeping first-seen order."""
+    merged: List[str] = []
+    for group in groups:
+        merged.extend(_normalize_url_list(group))
+    return _normalize_url_list(merged)
+
+
+def _next_fallback_url(alt_urls: object, failed_urls: object) -> str:
+    """First alternate url not attempted yet (empty string when exhausted)."""
+    tried = set(_normalize_url_list(failed_urls))
+    for url in _normalize_url_list(alt_urls):
+        if url not in tried:
+            return url
+    return ""
+
+
+def _url_host(url: str) -> str:
+    """Host part of a url, so notifications never print the full link."""
+    try:
+        return urllib.parse.urlparse(str(url or "")).netloc or "未知源"
+    except Exception:
+        return "未知源"
+
+
 def _download_task_from_payload(value: object) -> DownloadTask:
     """Strictly decode one persisted task while allowing older missing defaults."""
     if not isinstance(value, dict):
@@ -422,6 +471,12 @@ def _download_task_from_payload(value: object) -> DownloadTask:
         raise ValueError("task record contains an invalid delete flag")
     if type(task.source_sensitive) is not bool:
         raise ValueError("task record contains an invalid source sensitivity flag")
+    for name in ("alt_urls", "failed_urls"):
+        candidate = getattr(task, name)
+        if not isinstance(candidate, list) or any(
+            not isinstance(item, str) for item in candidate
+        ):
+            raise ValueError("task record contains an invalid fallback url list")
     if task.control_action not in {"", "pause", "remove"}:
         raise ValueError("task record contains an unknown control action")
     return task
@@ -2964,6 +3019,15 @@ class DownloadQueue(_SerialDownloadQueue):
                 if existing.state != "failed":
                     return False
                 task.task_id = existing.task_id
+                # Merge alternates discovered by this scan, then prefer the
+                # next unattempted one over re-queuing the exact same url.
+                # ``existing.url`` counts as attempted because the task is
+                # already in the failed state.
+                existing.alt_urls = _merge_fallback_urls(existing.alt_urls, task.alt_urls)
+                fallback_url = _next_fallback_url(
+                    existing.alt_urls,
+                    _merge_fallback_urls(existing.failed_urls, [existing.url]),
+                )
                 existing.state = "pending"
                 existing.progress = 0.0
                 existing.error = ""
@@ -2979,7 +3043,7 @@ class DownloadQueue(_SerialDownloadQueue):
                 existing.media_type = task.media_type
                 existing.season = task.season
                 existing.episode = task.episode
-                existing.url = task.url
+                existing.url = fallback_url or task.url
                 existing.root = task.root
                 existing.host_media_source = task.host_media_source
                 existing.host_media_id = task.host_media_id
@@ -3217,10 +3281,71 @@ class DownloadQueue(_SerialDownloadQueue):
                 self._release(task_id)
         return True
 
+    def _requeue_with_fallback(self, task: DownloadTask, error: str) -> bool:
+        """Rotate to the next untried alternate source, if any.
+
+        Returns True when the task was pushed back to ``pending`` with a new
+        url -- the caller must then NOT write a terminal state.  The rotation
+        is bounded by ``alt_urls`` and each url is attempted at most once
+        (``failed_urls``), so it always terminates in a real terminal state.
+        """
+        with self._lock:
+            tasks = self._read()
+            current = next(
+                (item for item in tasks if item.task_id == task.task_id), None
+            )
+            if current is None:
+                return False
+            failed = _merge_fallback_urls(current.failed_urls, [current.url])
+            candidate = _next_fallback_url(current.alt_urls, failed)
+            if not candidate:
+                return False
+            current.failed_urls = failed
+            current.url = candidate
+            current.state = "pending"
+            current.progress = 0.0
+            current.error = error
+            current.control_action = ""
+            current.delete_file = False
+            current.output = ""
+            current.completed_at = 0.0
+            current.downloaded_bytes = 0
+            current.attempts = 0
+            current.download_engine = ""
+            try:
+                self._write(tasks)
+            except Exception:
+                LOGGER.exception("LunaTV fallback requeue write failed")
+                return False
+            task.failed_urls = list(failed)
+            task.url = candidate
+            task.state = "pending"
+            task.progress = 0.0
+            task.error = error
+            task.attempts = 0
+            self._release(task.task_id)
+        remaining = len(_normalize_url_list(task.alt_urls)) - len(task.failed_urls)
+        suffix = (
+            f"（剩余 {remaining} 个候选）" if remaining > 0 else "（已是最后一个候选）"
+        )
+        self._notify(
+            "LunaTV 自动换源",
+            f"{self._notification_text(task)}：源 {_url_host(failed[-1])} 失败，"
+            f"切换到第 {len(task.failed_urls)} 个备选源 {_url_host(candidate)}{suffix}",
+        )
+        return True
+
     def _finish_failed(
         self, task: DownloadTask, control: _TaskControl, exc: Exception
     ) -> Dict[str, Any]:
         safe_error = _redact_error_urls(exc)
+        if control.action == "" and self._requeue_with_fallback(task, safe_error):
+            return {
+                "processed": 1,
+                "task_id": task.task_id,
+                "state": "pending",
+                "fallback": True,
+            }
         with self._lock:
             if control.action == "remove":
                 state = "remove"
@@ -3244,9 +3369,11 @@ class DownloadQueue(_SerialDownloadQueue):
                 self._release(task.task_id)
                 persisted = True
         if state == "failed" and persisted:
+            tried = len(_normalize_url_list(task.failed_urls))
+            suffix = f"（已尝试 {tried} 个源均失败）" if tried else ""
             self._notify(
                 "LunaTV 下载失败",
-                f"{self._notification_text(task)}：{safe_error}",
+                f"{self._notification_text(task)}：{safe_error}{suffix}",
             )
             return {
                 "processed": 1,
