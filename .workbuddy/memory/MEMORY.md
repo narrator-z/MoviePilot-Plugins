@@ -72,3 +72,21 @@
 - `MediaInfo.year` 是 **str**（`int()` 会触发 response_model 校验 500）；`MediaType` 枚举值是**中文**（`MediaType.MOVIE.value == "电影"`）。
 - 列表缩略图优先取 `poster_path`（只设 `cover` 会空白）。
 - 图片代理已配 `IMAGE_PROXY_ALLOWED_PRIVATE_RANGES` 覆盖 clash fake-ip，测试时别硬传 None。
+
+## 八、媒体库存量归位（2026-09-12 已执行）
+
+- **审计金标准**：`transferhistory` 同表存 `category`（MP 算出的正确分类）与 `dest`（实际落盘）。
+  `category` 与 `dest` 前缀不一致 = 该次整理落盘错了。查"整理对不对"**先跑这个一致性比对**，
+  比任何事后推断都可靠（本次 122/122 全不一致，聚合成 9 部剧）。
+- **分类策略没有兜底规则**：`MediaClassificationPolicy.active.rules[].when` 条件为——
+  国漫 = animation 且 origin_country∈{CN,TW,HK}；日番 = animation 且 JP；
+  国产剧 = {CN,TW,HK}；欧美剧 = {US,FR,GB,DE,ES,IT,NL,PT,RU,UK}；日韩剧 = JP/KR；
+  纪录片/儿童/综艺 看 genre；动画电影 看 animation；华语电影 看 original_language∈{zh,cn,bo,za}。
+  ⇒ **origin_country 不在白名单（如 CO 哥伦比亚）→ 无规则匹配 → 落"未分类"，这是正确行为，不是 bug。**
+- **`/media` 是单一 ext4 挂载点** → 库内搬迁为原子 rename（零数据搬运）。库 `transfer_type=link`
+  → 硬链接 link count=2：**删库内副本不影响下载源，删源也不影响库**（互为独立目录项）。
+- **归位取舍规则**（脚本 `.workbuddy/reorganize_lunatv.py`，带 dry-run、回收区而非直接删）：
+  `score = 体积，非 mp4 再 ×1.5`；同集由 score 大者占位。效果 = 跨格式时保住带字幕 mkv，
+  同格式时才按体积替换。执行结果：补入 85 文件/70G、回收 167 文件/47.2G、替换 6、删目录 13。
+- Emby 刷新：`POST http://192.168.31.145:8096/Library/Refresh` + header `X-Emby-Token: <apikey>` → 204。
+  Emby 侧看到的是宿主路径 `/vol2/1000/Media/...`，旧路径条目会在扫描后自动移除。
