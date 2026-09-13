@@ -4,7 +4,7 @@
     "name": "LunaTV 资源订阅",
     "description": "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。",
     "labels": "订阅,苹果CMS,m3u8,下载,媒体库",
-    "version": "0.4.91",
+    "version": "0.4.92",
     "icon": "lunatvsource.png",
     "author": "narrator-z",
     "project_url": "https://github.com/OneBigMoon/moviepilot-v3-lunatv-source",
@@ -12,6 +12,7 @@
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "0.4.92": "修复全局搜索/媒体识别链 to_dict 崩溃：search_medias 与 recognize_media 此前返回 pydantic schema 版 MediaInfo，宿主对模块产物统一调用 to_dict() 序列化，触发 'MediaInfo' object has no attribute 'to_dict' 未捕获异常，导致 /api/v1/media/search 整体 500（含关键词媒体搜索）。现宿主链路改返回 domain 版 MediaInfo（app.sdk.media 稳定出口），并以子类保留 CMS 详情链接；插件自有探索 API（schema response_model）不受影响",
       "0.4.91": "修复 0.4.90 引入的整季订阅回归：候选去重时 CmsEpisode 对象混入共享 url 候选表，订阅刷新报 'str' object has no attribute 'url'——现整季分支改用局部表持有候选对象，共享表仅存 url 字符串",
       "0.4.90": "LunaTV 持久化队列修复 0.4.90：整季订阅的备选源候选表误把 CmsEpisode 对象写入 alt_urls（落盘为字典），重启后严格校验拒载、插件无法启动——现整季分支统一转回 url 字符串；加载器兼容旧字典形态（读取时归一化）；单条坏记录改为「备份隔离后跳过」并通知，不再阻断插件启动",
       "0.4.89": "V3 规范对齐：宿主能力导入迁移至 app.sdk 稳定出口，移除 app.application.mediaserver 兜底分支；插件图标改用仓库本地 icons/lunatvsource.png",
