@@ -86,6 +86,40 @@ except Exception:  # pragma: no cover - standalone tests
     _HostMediaSource = None
     _HostMediaType = None
 
+_ChainMediaInfoClass: Optional[type] = None
+
+
+def _build_chain_media_info_class() -> Optional[type]:
+    """惰性构造宿主链路 MediaInfo 子类（domain 版 + CMS 详情链接保留）。
+
+    domain MediaInfo 的 ``detail_link`` 是只读 property，只识别内置数据源；
+    子类追加 ``detail_url`` 字段并覆盖该 property，使自定义 CMS 来源的
+    详情链接在 ``to_dict()`` 输出中不丢失。构造失败时返回 None，
+    由调用方回落 schema 版。
+    """
+    global _ChainMediaInfoClass
+    if _ChainMediaInfoClass is not None:
+        return _ChainMediaInfoClass
+    try:
+        from dataclasses import dataclass as _host_dataclass
+
+        from app.sdk.media import MediaInfo as _SdkMediaInfo
+
+        @_host_dataclass
+        class ChainMediaInfo(_SdkMediaInfo):
+            """宿主链路 MediaInfo：保持 to_dict 合同并保留 CMS 详情链接。"""
+
+            detail_url: Optional[str] = None
+
+            @property
+            def detail_link(self):
+                return self.detail_url or super().detail_link
+
+        _ChainMediaInfoClass = ChainMediaInfo
+    except Exception:  # pragma: no cover - standalone tests
+        _ChainMediaInfoClass = None
+    return _ChainMediaInfoClass
+
 # Keep optional host chains isolated: one unavailable compatibility import must
 # not disable native search result schemas or the remaining host bridges.
 try:  # pragma: no cover - exercised in a MoviePilot runtime
@@ -941,7 +975,7 @@ class LunaTVSource(_PluginBase):
     plugin_name = "LunaTV 资源订阅"
     plugin_desc = "接入 LunaTV/MoonTV 苹果 CMS 资源，复用 MoviePilot 原生搜索、订阅、目录、整理与媒体库链路。"
     plugin_icon = "lunatvsource.png"
-    plugin_version = "0.4.91"
+    plugin_version = "0.4.92"
     plugin_author = "narrator-z"
     author_url = "https://github.com/narrator-z"
     plugin_config_prefix = "lunatvsource_"
@@ -2806,6 +2840,61 @@ class LunaTVSource(_PluginBase):
             fields.pop("tmdb_id", None)
             fields.pop("classification_facts", None)
             return _schemas.MediaInfo(**fields)
+
+    def _chain_media_info(
+        self,
+        result: CmsResult,
+        association: Optional[Dict[str, Any]] = None,
+        season_only: bool = False,
+    ) -> Any:
+        """构造宿主链路（搜索聚合/识别/订阅/整理）使用的 domain MediaInfo。
+
+        宿主对模块产出的媒体对象统一调用 ``to_dict()`` 序列化，pydantic
+        schema 版 MediaInfo 没有该合同，进入搜索聚合后会触发
+        ``'MediaInfo' object has no attribute 'to_dict'``；此方法返回
+        ``app.sdk.media.MediaInfo``（domain 版），并用子类保留 CMS 详情链接。
+        """
+        chain_class = _build_chain_media_info_class()
+        if chain_class is None:
+            return self._media_info(result, association, season_only=season_only)
+
+        seasons: Dict[int, List[int]] = {}
+        for episode in result.episodes:
+            if episode.season_known:
+                seasons.setdefault(episode.season, []).append(episode.episode)
+
+        if season_only and not seasons:
+            season_start, season_end = result.season_range
+            if season_start > 0 and season_start == season_end:
+                seasons[season_start] = []
+
+        association = association or {}
+        fields: Dict[str, Any] = {
+            "type": self._host_media_type(result.media_type),
+            "title": normalize_media_title(result.title),
+            "year": result.year or None,
+            "media_source": self._host_media_source(),
+            "media_id": f"{result.source_key}:{result.vod_id}",
+            "seasons": {
+                key: [] if season_only else sorted(set(value))
+                for key, value in seasons.items()
+            },
+            "detail_url": result.detail or None,
+        }
+        if association.get("status") == "matched" and association.get("tmdb_id"):
+            try:
+                fields["tmdb_id"] = int(association["tmdb_id"])
+            except (TypeError, ValueError):
+                fields["tmdb_id"] = association["tmdb_id"]
+        for field in ("poster_path", "backdrop_path", "overview", "vote_average", "release_date"):
+            if association.get(field) not in (None, ""):
+                fields[field] = association[field]
+
+        classification_facts = extract_classification_facts(result)
+        if classification_protocol_available() and classification_facts:
+            fields["classification_facts"] = classification_facts
+
+        return chain_class(**fields)
 
     @staticmethod
     def _search_result_seasons(result: CmsResult) -> List[int]:
@@ -6677,9 +6766,9 @@ class LunaTVSource(_PluginBase):
             for result in self._season_media_cards(results):
                 prepared, association = self._prepare_result(result)
                 if prepared.media_type == "tv":
-                    medias.append(self._media_info(prepared, association, season_only=True))
+                    medias.append(self._chain_media_info(prepared, association, season_only=True))
                 else:
-                    medias.append(self._media_info(prepared, association))
+                    medias.append(self._chain_media_info(prepared, association))
             return medias
         except Exception as exc:
             self._logger.warning("LunaTV 全局媒体搜索失败：%s", exc)
@@ -7872,8 +7961,9 @@ class LunaTVSource(_PluginBase):
                 return None
             result, association = self._prepare_result(result)
             # 原生详情页需要统一 MediaInfo 的完整展示字段；仅返回 SDK 最小对象
-            # 会导致自定义来源详情页无法渲染。
-            return self._media_info(result, association)
+            # 会导致自定义来源详情页无法渲染。识别链下游会调用 to_dict()，
+            # 必须返回 domain 版（_chain_media_info），不能返回 schema 版。
+            return self._chain_media_info(result, association)
         except Exception as exc:
             self._logger.debug("LunaTV 原生识别失败：%s", exc)
             return None
